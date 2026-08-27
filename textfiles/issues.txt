@@ -1,0 +1,2 @@
+1) lease timeout is only 60 seconds but chunk server cannot extend lease leading to race conditions
+2) a new server (master) can become leader if election timeout exceeds the time it takes to connect.

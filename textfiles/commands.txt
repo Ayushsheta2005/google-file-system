@@ -1,0 +1,5 @@
+docker run -d --name gfs-master-linux-1 -p 9000:9000 -v master-metadata-linux-1:/app/metadata gfs-master python master.py --master-id master-linux-1 --port 9000 --peers 10.130.179.254:9000 10.130.179.155:9010
+
+docker run -d --name gfs-master-linux-2 -p 9010:9000 -v master-metadata-linux-2:/app/metadata gfs-master python master.py --master-id master-linux-2 --port 9000 --peers 10.130.179.254:9000 10.130.179.155:9000
+
+docker run -d --name gfs-master-windows -p 9000:9000 -v master-metadata-windows:/app/metadata gfs-master python master.py --master-id master-windows --port 9000 --peers 10.130.179.155:9000 10.130.179.155:9010

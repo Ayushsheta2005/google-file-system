@@ -1,0 +1,5 @@
+1) instead of maintaining an operational log ( which is maintained in gfs ) .. i am only maintaining state snapshots
+ and the leader communicates this snapshot to every master peer at the end of an operation.
+
+2) for locking metadata , fileinfo and state info instead of using normal locks we are using Reentrant locks (RLocks). this is 
+a more advanced version of lock in which even after locking we can lock again ( same thread ) and it will not result in a deadlock.

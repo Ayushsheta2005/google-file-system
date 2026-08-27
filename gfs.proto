@@ -1,0 +1,401 @@
+syntax = "proto3";
+
+package gfs;
+
+// Common data structures
+message ChunkHandle {
+  string handle = 1;
+}
+
+message ChunkLocation {
+  string server_id = 1;
+  string address = 2;
+  int32 port = 3;
+}
+
+message FileInfo {
+  string filename = 1;
+  int64 size = 2;
+  int32 chunk_size = 3;
+  repeated ChunkHandle chunks = 4;
+}
+
+// Master election and synchronization messages
+message MasterInfo {
+  string master_id = 1;
+  string address = 2;
+  int32 port = 3;
+  int64 term = 4;
+  bool is_primary = 5;
+  int64 last_heartbeat = 6;
+}
+
+message ElectionRequest {
+  string candidate_id = 1;
+  int64 term = 2;
+  int64 last_log_index = 3;
+  int64 last_log_term = 4;
+}
+
+message ElectionResponse {
+  string voter_id = 1;
+  int64 term = 2;
+  bool vote_granted = 3;
+}
+
+message SyncMetadataRequest {
+  string master_id = 1;
+  int64 term = 2;
+  string metadata_json = 3;
+  int64 version = 4;
+}
+
+message SyncMetadataResponse {
+  bool success = 1;
+  int64 current_version = 2;
+  string message = 3;
+}
+
+message MasterHeartbeatRequest {
+  string master_id = 1;
+  int64 term = 2;
+  bool is_primary = 3;
+  int64 metadata_version = 4;
+}
+
+message MasterHeartbeatResponse {
+  bool success = 1;
+  int64 term = 2;
+  bool acknowledge_primary = 3;
+}
+
+// Master service messages
+message CreateFileRequest {
+  string filename = 1;
+}
+
+message CreateFileResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DeleteFileRequest {
+  string filename = 1;
+}
+
+message DeleteFileResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetFileInfoRequest {
+  string filename = 1;
+}
+
+message GetFileInfoResponse {
+  bool success = 1;
+  FileInfo file_info = 2;
+  string message = 3;
+}
+
+// NEW: Add UpdateFileSize RPC for client to notify master of size changes
+message UpdateFileSizeRequest {
+  string filename = 1;
+  int64 new_size = 2;
+  int64 offset = 3;
+  int64 length = 4;
+}
+
+message UpdateFileSizeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetChunkLocationsRequest {
+  ChunkHandle chunk_handle = 1;
+}
+
+message GetChunkLocationsResponse {
+  bool success = 1;
+  repeated ChunkLocation locations = 2;
+  string message = 3;
+}
+
+message AllocateChunkRequest {
+  string filename = 1;
+  int32 chunk_index = 2;
+}
+
+message AllocateChunkResponse {
+  bool success = 1;
+  ChunkHandle chunk_handle = 2;
+  repeated ChunkLocation locations = 3;
+  string message = 4;
+}
+
+// // Fixed HeartbeatRequest to match chunk server expectations
+// message HeartbeatRequest {
+//   string chunk_server_id = 1;
+//   string chunk_server_address = 2;
+//   repeated string available_chunks = 3;
+//   int32 total_chunks = 4;
+//   int64 available_space = 5;
+// }
+
+message HeartbeatRequest{
+  string server_id = 1;
+  repeated ChunkHandle chunks =2;
+  int64 available_space = 3;
+  int32 port = 4;
+  string server_address = 5;
+  int32 total_chunks = 6;
+}
+
+message HeartbeatResponse {
+  bool success = 1;
+  repeated ChunkLocation chunks_to_delete=2;
+  repeated ReplicationTask replication_tasks = 3;
+}
+
+message ReplicationTask {
+  ChunkHandle chunk_handle = 1;
+  repeated ChunkLocation source_locations = 2;
+  ChunkLocation target_location = 3;
+}
+
+// Master discovery messages
+message GetPrimaryMasterRequest {
+  string requester_id = 1;
+}
+
+message GetPrimaryMasterResponse {
+  bool success = 1;
+  MasterInfo primary_master = 2;
+  repeated MasterInfo all_masters = 3;
+  string message = 4;
+}
+
+// Directory operations messages
+message CreateDirectoryRequest {
+  string directory_path = 1;
+}
+
+message CreateDirectoryResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DeleteDirectoryRequest {
+  string directory_path = 1;
+  bool recursive = 2;
+}
+
+message DeleteDirectoryResponse {
+  bool success = 1;
+  string message = 2;
+  int32 items_deleted = 3;
+}
+
+message ListDirectoryRequest {
+  string directory_path = 1;
+}
+
+message DirectoryEntry {
+  string name = 1;
+  string type = 2; // "file" or "directory"
+  int64 size = 3;   // For files, 0 for directories
+  int64 created_time = 4;
+  int64 modified_time = 5;
+}
+
+message ListDirectoryResponse {
+  bool success = 1;
+  repeated DirectoryEntry entries = 2;
+  string message = 3;
+}
+
+// List all files in filesystem
+message ListAllFilesRequest {
+  // Empty request - lists everything
+}
+
+message FileSystemEntry {
+  string path = 1;
+  string type = 2; // "file" or "directory"
+  int64 size = 3;
+  int64 created_time = 4;
+  int64 modified_time = 5;
+}
+
+message ListAllFilesResponse {
+  bool success = 1;
+  repeated FileSystemEntry entries = 2;
+  string message = 3;
+}
+
+// Chunk server messages
+message WriteChunkRequest {
+  ChunkHandle chunk_handle = 1;
+  int64 offset = 2;
+  bytes data = 3;
+  string lease_id = 4;
+  repeated ChunkLocation secondary_locations = 5;
+  int32 chunk_version = 6;
+}
+
+message WriteChunkResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ReadChunkRequest {
+  ChunkHandle chunk_handle = 1;
+  int64 offset = 2;
+  int64 length = 3;
+}
+
+message ReadChunkResponse {
+  bool success = 1;
+  bytes data = 2;
+  string message = 3;
+}
+
+message AppendChunkRequest {
+  ChunkHandle chunk_handle = 1;
+  bytes data = 2;
+  string lease_id = 3;
+  string data_id =4;
+  int32 version=5;
+  repeated string secondary_locations = 6;
+}
+
+message AppendChunkResponse {
+  bool success = 1;
+  int64 offset = 2;
+  string message = 3;
+}
+
+message GetChunkChecksumRequest {
+  ChunkHandle chunk_handle = 1;
+}
+
+message GetChunkChecksumResponse {
+  bool success = 1;
+  string checksum = 2;
+  string message = 3;
+}
+
+// Lease management messages
+message RequestLeaseRequest {
+  ChunkHandle chunk_handle = 1;
+}
+
+message RequestLeaseResponse {
+  bool success = 1;
+  string primary_server = 2;
+  repeated ChunkLocation locations = 3;
+  int64 lease_expiry = 4;
+  string message = 5;
+  int32 chunk_version = 6;  // ✅ Version number for stale replica detection
+}
+
+message UpdateChunkSizeRequest {
+  ChunkHandle chunk_handle = 1;
+  int64 size = 2;
+}
+
+message UpdateChunkSizeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Data flow messages
+message PushDataRequest {
+  bytes data = 1;
+  string data_id = 2;
+  string next_server = 3; // For pipeline
+  repeated string remaining_chain = 4; // Full chain for visibility/debugging
+}
+
+message PushDataResponse {
+  bool success = 1;
+  string message = 2;
+  bool pipeline_complete = 3; // True if this was the last server in chain
+}
+
+// Services
+service MasterService {
+  rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+  rpc GetFileInfo(GetFileInfoRequest) returns (GetFileInfoResponse);
+  rpc GetChunkLocations(GetChunkLocationsRequest) returns (GetChunkLocationsResponse);
+  rpc AllocateChunk(AllocateChunkRequest) returns (AllocateChunkResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc GetPrimaryMaster(GetPrimaryMasterRequest) returns (GetPrimaryMasterResponse);
+
+  // Lease management
+  rpc RequestLease(RequestLeaseRequest) returns (RequestLeaseResponse);
+  rpc UpdateChunkSize(UpdateChunkSizeRequest) returns (UpdateChunkSizeResponse);
+  
+  // Directory operations
+  rpc CreateDirectory(CreateDirectoryRequest) returns (CreateDirectoryResponse);
+  rpc DeleteDirectory(DeleteDirectoryRequest) returns (DeleteDirectoryResponse);
+  rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
+  rpc ListAllFiles(ListAllFilesRequest) returns (ListAllFilesResponse);
+  
+  // NEW: Add UpdateFileSize RPC for client to notify master of size changes
+  rpc UpdateFileSize(UpdateFileSizeRequest) returns (UpdateFileSizeResponse);
+}
+
+service MasterElectionService {
+  rpc RequestVote(ElectionRequest) returns (ElectionResponse);
+  rpc SendHeartbeat(MasterHeartbeatRequest) returns (MasterHeartbeatResponse);
+  rpc SyncMetadata(SyncMetadataRequest) returns (SyncMetadataResponse);
+}
+
+service ChunkServerService {
+  rpc WriteChunk(WriteChunkRequest) returns (WriteChunkResponse);
+  rpc ReadChunk(ReadChunkRequest) returns (ReadChunkResponse);
+  rpc AppendChunk(AppendChunkRequest) returns (AppendChunkResponse);
+  rpc GetChunkChecksum(GetChunkChecksumRequest) returns (GetChunkChecksumResponse);
+  rpc PushData(PushDataRequest) returns (PushDataResponse);
+}
+
+service GFSMaster {
+  // File operations
+  rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+  rpc GetFileInfo(GetFileInfoRequest) returns (GetFileInfoResponse);
+  
+  // Directory operations
+  rpc CreateDirectory(CreateDirectoryRequest) returns (CreateDirectoryResponse);
+  rpc DeleteDirectory(DeleteDirectoryRequest) returns (DeleteDirectoryResponse);
+  rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
+  rpc ListAllFiles(ListAllFilesRequest) returns (ListAllFilesResponse);
+  
+  // Chunk operations
+  rpc GetChunkLocations(GetChunkLocationsRequest) returns (GetChunkLocationsResponse);
+  rpc AllocateChunk(AllocateChunkRequest) returns (AllocateChunkResponse);
+  
+  // Chunk server management
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  
+  // Master coordination
+  rpc GetPrimaryMaster(GetPrimaryMasterRequest) returns (GetPrimaryMasterResponse);
+}
+
+service GFSMasterCoordination {
+  // Master election and coordination
+  rpc RequestVote(ElectionRequest) returns (ElectionResponse);
+  rpc SyncMetadata(SyncMetadataRequest) returns (SyncMetadataResponse);
+  rpc MasterHeartbeat(MasterHeartbeatRequest) returns (MasterHeartbeatResponse);
+}
+
+service GFSChunkServer {
+  // Chunk operations
+  rpc WriteChunk(WriteChunkRequest) returns (WriteChunkResponse);
+  rpc ReadChunk(ReadChunkRequest) returns (ReadChunkResponse);
+  rpc AppendChunk(AppendChunkRequest) returns (AppendChunkResponse);
+  rpc GetChunkChecksum(GetChunkChecksumRequest) returns (GetChunkChecksumResponse);
+  
+}
