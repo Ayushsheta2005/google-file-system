@@ -16,10 +16,18 @@ from dataclasses import dataclass
 
 import gfs_pb2
 import gfs_pb2_grpc
+from ec_storage import ShardStore, ECWorker
 
-# Configuration constants
-CHUNK_SIZE = 64 * 1024 * 1024  # 64MB
-HEARTBEAT_INTERVAL = 30  # seconds
+# Configuration constants -- see gfs_config.py and docs/adr/
+from gfs_config import (
+    CHUNK_SIZE,
+    HEARTBEAT_INTERVAL,
+    LEADER_DISCOVERY_INTERVAL,
+    LEADER_DISCOVERY_RETRY_INTERVAL,
+    DEFAULT_MAX_WORKERS,
+    GRPC_SERVER_OPTIONS,
+    GRPC_CHANNEL_OPTIONS,
+)
 
 @dataclass
 class ChunkInfo:
@@ -43,7 +51,8 @@ class GFSChunkServer:
                  master_addresses: List[str] = None, 
                  storage_dir: str = "chunks",
                  external_address: str = None,
-                 external_port: int = None):
+                 external_port: int = None,
+                 log_level: str = "DEBUG"):
         self.server_id = server_id or f"chunkserver_{uuid.uuid4().hex[:8]}"
         self.port = port
         self.master_addresses = master_addresses or []
@@ -53,14 +62,16 @@ class GFSChunkServer:
         self.external_port = external_port or port
         
         # Initialize logging first
+        os.makedirs(storage_dir, exist_ok=True)
         logging.basicConfig(
-            level=logging.DEBUG,
+            level=getattr(logging, log_level),
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.StreamHandler(),
-                logging.FileHandler(f'{self.server_id}.log')
+                logging.FileHandler(os.path.join(storage_dir, f'{self.server_id}.log'))
             ]
         )
+        logging.getLogger().setLevel(getattr(logging, log_level))
         self.logger = logging.getLogger(__name__)
         
         # Log all initialization details
@@ -96,7 +107,13 @@ class GFSChunkServer:
         self.current_master = None
         self.master_stub = None
         self.master_channel = None
-        # self.master_lock = threading.Lock()
+        # Guards current_master / master_stub. It had been commented out
+        # while three call sites still used it, so every code path that
+        # reached them raised AttributeError. Those paths only run when no
+        # leader is currently known, which is why it survived: the happy
+        # path never touches them. Re-entrant because connect_to_master()
+        # can be reached from a call that already holds it.
+        self.master_lock = threading.RLock()
 
         # GFS Write Protocol - Data caching and leases
         self.cached_data: Dict[str, bytes] = {}  # data_id -> data
@@ -110,8 +127,29 @@ class GFSChunkServer:
         self.master_channels = {}  # address -> channel
         self.master_stubs = {}     # address -> stub
         self.leader_stub = None    # Current leader stub
-        self.leader_discovery_interval = 10  # seconds
+        # Backs off only while a leader is known. A chunk server that starts
+        # before the masters finish electing used to sleep a flat 10s before
+        # retrying, which dominated cluster start-up time. See ADR-008.
+        self.leader_discovery_interval = LEADER_DISCOVERY_INTERVAL
+        self.leader_discovery_retry_interval = LEADER_DISCOVERY_RETRY_INTERVAL
         
+        # Erasure-coded shards this server holds (ADR-005). Kept separate
+        # from self.chunks: a shard is not a chunk, and conflating them would
+        # let the master count a single shard as a whole replica.
+        self.shard_store = ShardStore(storage_dir, logger=self.logger)
+        self.ec_worker = ECWorker(
+            self.shard_store,
+            fetch_shard=self._fetch_shard_remote,
+            push_shard=self._push_shard_remote,
+            logger=self.logger)
+        self._ec_lock = threading.RLock()
+        self._ec_in_progress = set()
+
+        # Clone bookkeeping (ADR-003)
+        self._clone_lock = threading.RLock()
+        self._clones_in_progress = set()
+        self._max_concurrent_clones = 2
+
         # Background tasks
         self.running = False
         self.heartbeat_thread = None
@@ -130,7 +168,7 @@ class GFSChunkServer:
         """Establish connections to all master servers"""
         for master_address in self.master_addresses:
             try:
-                channel = grpc.insecure_channel(master_address)
+                channel = grpc.insecure_channel(master_address, options=GRPC_CHANNEL_OPTIONS)
                 stub = gfs_pb2_grpc.MasterServiceStub(channel)
                 self.master_channels[master_address] = channel
                 self.master_stubs[master_address] = stub
@@ -187,8 +225,11 @@ class GFSChunkServer:
     def leader_discovery_loop(self):
         """Background loop for leader discovery and failover"""
         while self.running:
-            time.sleep(self.leader_discovery_interval)
-            
+            # Poll fast while leaderless (start-up, or mid-failover), slowly
+            # once a leader is known and answering.
+            time.sleep(self.leader_discovery_interval if self.leader_stub
+                       else self.leader_discovery_retry_interval)
+
             # Check if current leader is still alive
             if self.current_leader_address and self.leader_stub:
                 try:
@@ -246,7 +287,7 @@ class GFSChunkServer:
             channel = None
             try:
                 self.logger.debug(f"Creating gRPC channel to {master_addr}")
-                channel = grpc.insecure_channel(master_addr)
+                channel = grpc.insecure_channel(master_addr, options=GRPC_CHANNEL_OPTIONS)
                 
                 self.logger.debug(f"Creating MasterService stub for {master_addr}")
                 stub = gfs_pb2_grpc.MasterServiceStub(channel)
@@ -315,14 +356,7 @@ class GFSChunkServer:
                     # Create channel with timeout
                     channel = grpc.insecure_channel(
                         f"{host}:{port}",
-                        options=[
-                            ('grpc.keepalive_time_ms', 30000),
-                            ('grpc.keepalive_timeout_ms', 5000),
-                            ('grpc.keepalive_permit_without_calls', True),
-                            ('grpc.http2.max_pings_without_data', 0),
-                            ('grpc.http2.min_time_between_pings_ms', 10000),
-                            ('grpc.http2.min_ping_interval_without_data_ms', 300000)
-                        ]
+                        options=GRPC_CHANNEL_OPTIONS
                     )
                     
                     # FIXED: Use MasterServiceStub instead of GFSMasterStub
@@ -338,12 +372,19 @@ class GFSChunkServer:
                         local_ip = get_local_ip()
                         server_address = f"{local_ip}:{self.port}"
                     
+                    # These field names (chunk_server_id / chunk_server_address
+                    # / available_chunks) match the HeartbeatRequest that is
+                    # commented out in gfs.proto, not the one in use -- so this
+                    # call raised ValueError every time it ran. It only runs on
+                    # the no-leader-known path, which is why it went unnoticed.
                     request = gfs_pb2.HeartbeatRequest(
-                        chunk_server_id=self.server_id,
-                        chunk_server_address=server_address,
-                        available_chunks=list(self.chunks.keys()),
+                        server_id=self.server_id,
+                        server_address=server_address,
+                        chunks=[gfs_pb2.ChunkHandle(handle=h)
+                                for h in self.chunks.keys()],
                         total_chunks=len(self.chunks),
-                        available_space=self.get_available_space()
+                        available_space=self.get_available_space(),
+                        port=self.external_port
                     )
                     
                     self.logger.info(f"   📤 Sending test heartbeat:")
@@ -359,10 +400,24 @@ class GFSChunkServer:
                     if self.master_channel:
                         self.master_channel.close()
                     
-                    # Store connection details
+                    # Store connection details.
+                    #
+                    # Two connection-tracking schemes coexist in this class:
+                    # the original single-master pair (master_stub /
+                    # current_master) and the multi-master pair added later
+                    # (leader_stub / current_leader_address). They were never
+                    # reconciled, so this fallback path populated the first
+                    # pair while send_heartbeat() read the second -- meaning
+                    # that whenever leader discovery failed and this ran, the
+                    # chunk server reconnected successfully and then
+                    # heartbeated into a None stub forever. Set both.
                     self.master_channel = channel
                     self.master_stub = stub
                     self.current_master = f"{host}:{port}"
+                    self.leader_stub = stub
+                    self.current_leader_address = self.current_master
+                    self.master_channels[self.current_master] = channel
+                    self.master_stubs[self.current_master] = stub
                     
                     self.logger.info(f"   ✅ Successfully connected to master: {self.current_master}")
                     if hasattr(response, 'status'):
@@ -445,13 +500,26 @@ class GFSChunkServer:
                 local_ip = get_local_ip()
                 server_address = f"{local_ip}:{self.port}"
             
+            shard_reports = [
+                gfs_pb2.ShardLocation(server_id=self.server_id,
+                                      address=server_address.rsplit(':', 1)[0],
+                                      port=self.external_port,
+                                      shard_index=si.index,
+                                      chunk_handle=si.handle,
+                                      original_length=si.original_length,
+                                      data_shards=si.k,
+                                      parity_shards=si.m)
+                for si in self.shard_store.held()
+            ]
+
             request = gfs_pb2.HeartbeatRequest(
                 server_id=self.server_id,
                 server_address=server_address,
-                chunks=chunk_handles,   
+                chunks=chunk_handles,
                 total_chunks=len(self.chunks),
                 available_space=self.get_available_space(),
-                port = self.external_port
+                port = self.external_port,
+                shards=shard_reports
             )
             
             # Log heartbeat details every 10th heartbeat to avoid spam
@@ -472,7 +540,24 @@ class GFSChunkServer:
                     self.logger.info(f"   ✅ Heartbeat response status: {response.status}")
                 if hasattr(response, 'message') and response.message:
                     self.logger.info(f"   💬 Master message: {response.message}")
-                    
+
+            # The master piggybacks work on the heartbeat reply (ADR-003).
+            # Both are handled off this thread: the heartbeat loop must keep
+            # ticking, and a 64 MB clone would otherwise stall it long enough
+            # for the master to declare this server dead.
+            if response.chunks_to_delete:
+                self._handle_deletions(
+                    [h.handle for h in response.chunks_to_delete])
+            if response.replication_tasks:
+                self._handle_replication_tasks(response.replication_tasks)
+            if response.ec_encode_tasks:
+                self._handle_ec_encode_tasks(response.ec_encode_tasks)
+            if response.ec_repair_tasks:
+                self._handle_ec_repair_tasks(response.ec_repair_tasks)
+            if response.shards_to_delete:
+                for req in response.shards_to_delete:
+                    self.shard_store.delete(req.chunk_handle.handle, req.shard_index)
+
         except grpc.RpcError as e:
             self.logger.error(f"❌ Heartbeat failed: {e.code()} - {e.details()}")
             self.current_leader_address = None
@@ -514,6 +599,227 @@ class GFSChunkServer:
     #         # Connection failed, trigger leader rediscovery
     #         self.current_leader_address = None
     #         self.leader_stub = None
+
+
+    # ==================================================================
+    # Re-replication and garbage collection (ADR-003, ADR-004)
+    # ==================================================================
+
+    def _handle_deletions(self, handles):
+        """Reclaim chunks the master says this server should no longer hold."""
+        removed = 0
+        for handle in handles:
+            try:
+                with self.chunk_lock:
+                    self.chunks.pop(handle, None)
+                path = self.get_chunk_path(handle)
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed += 1
+            except OSError as e:
+                self.logger.error(f'failed to reclaim chunk {handle}: {e}')
+        if removed:
+            self.logger.info(f'🗑️  reclaimed {removed} chunk(s) on master instruction')
+
+    def _handle_replication_tasks(self, tasks):
+        """Start a clone per task, bounded by a small worker pool.
+
+        Cloning runs in the background so the heartbeat loop keeps ticking;
+        a 64 MB transfer on the heartbeat thread would look like a dead
+        server to the master and trigger exactly the re-replication storm
+        this is supposed to resolve.
+        """
+        for task in tasks:
+            handle = task.chunk_handle.handle
+            with self._clone_lock:
+                if handle in self._clones_in_progress:
+                    continue
+                if len(self._clones_in_progress) >= self._max_concurrent_clones:
+                    self.logger.debug(f'clone slots full, deferring {handle}')
+                    continue
+                self._clones_in_progress.add(handle)
+
+            sources = [(loc.address, loc.port, loc.server_id)
+                       for loc in task.source_locations]
+            t = threading.Thread(
+                target=self._clone_chunk,
+                args=(handle, sources, task.chunk_version),
+                daemon=True)
+            t.start()
+
+    def _clone_chunk(self, handle: str, sources, expected_version: int):
+        """Pull a chunk from a peer replica and install it locally.
+
+        The *target* pulls rather than a source pushing: the target is by
+        definition the node with spare capacity, and a pull means a dead
+        target costs nobody else bandwidth.
+
+        Written to a temp file and renamed into place, so a clone that dies
+        halfway cannot leave a short chunk that looks complete and then gets
+        reported as a healthy replica.
+        """
+        try:
+            for address, port, source_id in sources:
+                try:
+                    data = self._fetch_chunk_from(address, port, handle)
+                    if data is None:
+                        continue
+
+                    final = self.get_chunk_path(handle)
+                    tmp = final + '.clone.tmp'
+                    with open(tmp, 'wb') as f:
+                        f.write(data)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.rename(tmp, final)
+
+                    with self.chunk_lock:
+                        self.chunks[handle] = ChunkInfo(
+                            handle=handle,
+                            size=len(data),
+                            version=expected_version,
+                            checksum=self.calculate_checksum(final))
+
+                    self.logger.info(
+                        f'📥 cloned chunk {handle} ({len(data)} bytes) from {source_id}')
+                    return True
+                except Exception as e:
+                    self.logger.warning(
+                        f'clone of {handle} from {source_id} failed: {e}; trying next source')
+                    continue
+
+            self.logger.error(f'clone of {handle} failed from every source')
+            return False
+        finally:
+            # Always release the slot. Leaking it would quietly shrink this
+            # server's clone capacity to zero over time.
+            with self._clone_lock:
+                self._clones_in_progress.discard(handle)
+
+    def _fetch_chunk_from(self, address: str, port: int, handle: str):
+        """Read a whole chunk from a peer using the ordinary ReadChunk path."""
+        target = f'{address}:{port}'
+        with grpc.insecure_channel(target, options=GRPC_CHANNEL_OPTIONS) as channel:
+            stub = gfs_pb2_grpc.ChunkServerServiceStub(channel)
+            resp = stub.ReadChunk(
+                gfs_pb2.ReadChunkRequest(
+                    chunk_handle=gfs_pb2.ChunkHandle(handle=handle),
+                    offset=0,
+                    length=CHUNK_SIZE),
+                timeout=120)
+            if not resp.success:
+                raise RuntimeError(resp.message or 'read refused')
+            return resp.data
+
+
+    # ==================================================================
+    # Erasure coding (ADR-005)
+    # ==================================================================
+
+    def _push_shard_remote(self, address, port, handle, index, data,
+                           k, m, original_length, version) -> bool:
+        """Place one shard on a peer (or locally, if we are the target)."""
+        if f'{address}:{port}' in (f'{get_local_ip()}:{self.external_port}',
+                                   f'127.0.0.1:{self.port}') or port == self.external_port:
+            try:
+                self.shard_store.put(handle, index, data, k, m,
+                                     original_length, version)
+                return True
+            except OSError as e:
+                self.logger.error(f'local shard store failed: {e}')
+                return False
+        try:
+            with grpc.insecure_channel(f'{address}:{port}',
+                                       options=GRPC_CHANNEL_OPTIONS) as ch:
+                stub = gfs_pb2_grpc.ChunkServerServiceStub(ch)
+                resp = stub.StoreShard(gfs_pb2.StoreShardRequest(
+                    chunk_handle=gfs_pb2.ChunkHandle(handle=handle),
+                    shard_index=index, data=data, chunk_version=version,
+                    original_length=original_length,
+                    data_shards=k, parity_shards=m), timeout=120)
+                return resp.success
+        except grpc.RpcError as e:
+            self.logger.warning(f'StoreShard to {address}:{port} failed: {e.code()}')
+            return False
+
+    def _fetch_shard_remote(self, address, port, handle, index):
+        local = self.shard_store.get(handle, index)
+        if local is not None:
+            return local
+        try:
+            with grpc.insecure_channel(f'{address}:{port}',
+                                       options=GRPC_CHANNEL_OPTIONS) as ch:
+                stub = gfs_pb2_grpc.ChunkServerServiceStub(ch)
+                resp = stub.ReadShard(gfs_pb2.ReadShardRequest(
+                    chunk_handle=gfs_pb2.ChunkHandle(handle=handle),
+                    shard_index=index), timeout=120)
+                return resp.data if resp.success else None
+        except grpc.RpcError:
+            return None
+
+    def _handle_ec_encode_tasks(self, tasks):
+        for task in tasks:
+            handle = task.chunk_handle.handle
+            with self._ec_lock:
+                if handle in self._ec_in_progress:
+                    continue
+                self._ec_in_progress.add(handle)
+            targets = [{'server_id': t.server_id, 'address': t.address,
+                        'port': t.port} for t in task.shard_targets]
+            threading.Thread(target=self._run_ec_encode, daemon=True,
+                             args=(handle, task.data_shards, task.parity_shards,
+                                   task.chunk_version, targets)).start()
+
+    def _run_ec_encode(self, handle, k, m, version, targets):
+        try:
+            data = self.read_chunk_data(handle, 0, CHUNK_SIZE)
+            if data is None:
+                self.logger.warning(f'EC encode skipped: {handle} not held here')
+                return
+            ok, detail = self.ec_worker.encode_and_distribute(
+                handle, data, k, m, version, targets)
+            if ok:
+                # The master drops the replicas only after it sees all k+m
+                # shards reported, so a partial encode degrades to "wasted
+                # work" rather than "data loss".
+                self.logger.info(f'🧮 EC encoded {handle}: {detail}')
+            else:
+                self.logger.error(f'EC encode of {handle} incomplete: {detail}')
+        except Exception as e:
+            self.logger.error(f'EC encode of {handle} raised: {e}')
+        finally:
+            with self._ec_lock:
+                self._ec_in_progress.discard(handle)
+
+    def _handle_ec_repair_tasks(self, tasks):
+        for task in tasks:
+            handle = task.chunk_handle.handle
+            key = f'{handle}#repair{task.shard_index}'
+            with self._ec_lock:
+                if key in self._ec_in_progress:
+                    continue
+                self._ec_in_progress.add(key)
+            sources = [{'server_id': s.server_id, 'address': s.address,
+                        'port': s.port, 'shard_index': s.shard_index}
+                       for s in task.sources]
+            threading.Thread(target=self._run_ec_repair, daemon=True,
+                             args=(key, handle, task.shard_index, task.data_shards,
+                                   task.parity_shards, task.original_length,
+                                   sources)).start()
+
+    def _run_ec_repair(self, key, handle, index, k, m, original_length, sources):
+        try:
+            ok, detail = self.ec_worker.reconstruct_shard(
+                handle, index, k, m, original_length, sources)
+            if ok:
+                self.logger.info(f'🔧 EC repair {handle}#{index}: {detail}')
+            else:
+                self.logger.error(f'EC repair {handle}#{index} failed: {detail}')
+        except Exception as e:
+            self.logger.error(f'EC repair {handle}#{index} raised: {e}')
+        finally:
+            with self._ec_lock:
+                self._ec_in_progress.discard(key)
 
     def heartbeat_loop(self):
         """Background heartbeat loop with persistent connection attempts"""
@@ -768,7 +1074,7 @@ class GFSChunkServer:
                                   chunk_handle: str, offset: int, data: bytes, serial: int, version: int = 0) -> bool:
         """Forward write operation to a secondary replica"""
         try:
-            channel = grpc.insecure_channel(f"{secondary_address}:{secondary_port}")
+            channel = grpc.insecure_channel(f"{secondary_address}:{secondary_port}", options=GRPC_CHANNEL_OPTIONS)
             stub = gfs_pb2_grpc.ChunkServerServiceStub(channel)
             
             response = stub.WriteChunk(
@@ -1165,7 +1471,7 @@ class ChunkServerServiceServicer(gfs_pb2_grpc.ChunkServerServiceServicer):
                     for secondary_loc in secondary_locations:
                         try:
                             # secondary_loc is now a string "address:port"
-                            channel = grpc.insecure_channel(secondary_loc)
+                            channel = grpc.insecure_channel(secondary_loc, options=GRPC_CHANNEL_OPTIONS)
                             stub = gfs_pb2_grpc.ChunkServerServiceStub(channel)
                             
                             # Send padding command
@@ -1217,7 +1523,7 @@ class ChunkServerServiceServicer(gfs_pb2_grpc.ChunkServerServiceServicer):
                 for secondary_loc in secondary_locations:
                     try:
                         # secondary_loc is now a string "address:port"
-                        channel = grpc.insecure_channel(secondary_loc)
+                        channel = grpc.insecure_channel(secondary_loc, options=GRPC_CHANNEL_OPTIONS)
                         stub = gfs_pb2_grpc.ChunkServerServiceStub(channel)
                         
                         response = stub.AppendChunk(
@@ -1381,7 +1687,7 @@ class ChunkServerServiceServicer(gfs_pb2_grpc.ChunkServerServiceServicer):
                         next_next_server = remaining_chain[1]
                     
                     # Forward to next server and WAIT for its acknowledgment
-                    channel = grpc.insecure_channel(f"{addr}:{port}")
+                    channel = grpc.insecure_channel(f"{addr}:{port}", options=GRPC_CHANNEL_OPTIONS)
                     stub = gfs_pb2_grpc.ChunkServerServiceStub(channel)
                     
                     forward_response = stub.PushData(
@@ -1471,6 +1777,39 @@ class ChunkServerServiceServicer(gfs_pb2_grpc.ChunkServerServiceServicer):
     #             message=f"Failed to append to chunk {chunk_handle}"
     #         )
 
+    # ------------------------------------------------------------------
+    # Erasure-coded shard RPCs (ADR-005)
+    # ------------------------------------------------------------------
+    def StoreShard(self, request, context):
+        handle = request.chunk_handle.handle
+        try:
+            self.chunk_server.shard_store.put(
+                handle, request.shard_index, request.data,
+                request.data_shards, request.parity_shards,
+                request.original_length, request.chunk_version)
+            self.chunk_server.logger.info(
+                f'stored shard {handle}#{request.shard_index} '
+                f'({len(request.data)} bytes)')
+            return gfs_pb2.StoreShardResponse(success=True, message='stored')
+        except OSError as e:
+            return gfs_pb2.StoreShardResponse(success=False, message=str(e))
+
+    def ReadShard(self, request, context):
+        handle = request.chunk_handle.handle
+        data = self.chunk_server.shard_store.get(handle, request.shard_index)
+        if data is None:
+            return gfs_pb2.ReadShardResponse(
+                success=False, shard_index=request.shard_index,
+                message=f'shard {handle}#{request.shard_index} not held here')
+        return gfs_pb2.ReadShardResponse(
+            success=True, data=data, shard_index=request.shard_index)
+
+    def DeleteShard(self, request, context):
+        existed = self.chunk_server.shard_store.delete(
+            request.chunk_handle.handle, request.shard_index)
+        return gfs_pb2.DeleteShardResponse(
+            success=True, message='deleted' if existed else 'not present')
+
     def GetChunkChecksum(self, request, context):
         """Get checksum of a chunk"""
         chunk_handle = request.chunk_handle.handle
@@ -1489,18 +1828,23 @@ class ChunkServerServiceServicer(gfs_pb2_grpc.ChunkServerServiceServicer):
                 )
 
 def serve(server_id: str = None, port: int = 9001, master_addresses: List[str] = None,
-          external_address: str = None, external_port: int = None):
+          external_address: str = None, external_port: int = None,
+          storage_dir: str = "chunks", max_workers: int = DEFAULT_MAX_WORKERS,
+          log_level: str = "INFO"):
     """Start the GFS Chunk Server"""
     chunk_server = GFSChunkServer(
         server_id=server_id,
         port=port,
         master_addresses=master_addresses,
         external_address=external_address,
-        external_port=external_port
+        external_port=external_port,
+        storage_dir=storage_dir,
+        log_level=log_level
     )
     chunk_server.start_background_tasks()
-    
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers),
+                         options=GRPC_SERVER_OPTIONS)
     gfs_pb2_grpc.add_ChunkServerServiceServicer_to_server(
         ChunkServerServiceServicer(chunk_server), server
     )
@@ -1528,6 +1872,13 @@ if __name__ == '__main__':
     parser.add_argument('--masters', type=str, nargs='+', default=['localhost:9000'], help='Master server addresses')
     parser.add_argument('--external-address', type=str, help='External address for client connections (for Docker networking)')
     parser.add_argument('--external-port', type=int, help='External port for client connections (for Docker networking)')
+    parser.add_argument('--storage-dir', type=str, default='chunks',
+                        help='Directory this chunk server stores chunk files in')
+    parser.add_argument('--max-workers', type=int, default=DEFAULT_MAX_WORKERS,
+                        help='gRPC server thread pool size')
+    parser.add_argument('--log-level', type=str, default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = parser.parse_args()
-    
-    serve(args.server_id, args.port, args.masters, args.external_address, args.external_port)
+
+    serve(args.server_id, args.port, args.masters, args.external_address, args.external_port,
+          storage_dir=args.storage_dir, max_workers=args.max_workers, log_level=args.log_level)

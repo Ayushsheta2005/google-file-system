@@ -10,9 +10,17 @@ import sys
 
 import gfs_pb2
 import gfs_pb2_grpc
+from metacache import MetadataCache
+from ec_storage import decode_chunk
 
-# Configuration constants
-CHUNK_SIZE = 64 * 1024 * 1024  # 64MB
+# Configuration constants -- see gfs_config.py and docs/adr/
+from gfs_config import (
+    CHUNK_SIZE,
+    GRPC_CHANNEL_OPTIONS,
+    CLIENT_CACHE_MODE,
+    CLIENT_CACHE_SIZE,
+    CLIENT_CACHE_TTL,
+)
 
 # Path constants for client-side normalization
 PATH_SEPARATOR = '/'
@@ -30,6 +38,19 @@ class MultiMasterGFSClient:
         self.current_leader = None
         self.master_stubs = {}  # Cache for master connections
         self.chunk_server_stubs = {}  # Cache for chunk server connections
+
+        # Metadata cache (ADR-006). Without it every read costs a GetFileInfo
+        # plus a GetChunkLocations per chunk before any data moves.
+        # Shard maps for erasure-coded chunks, learned from
+        # GetChunkLocations. Held beside MetadataCache rather than inside it,
+        # so `_forget_chunk` below keeps the two in lockstep -- a shard map
+        # that outlives its location entry is exactly the stale-read bug the
+        # cache invalidation rules exist to prevent.
+        self._ec_info = {}
+
+        self.cache = MetadataCache(mode=CLIENT_CACHE_MODE,
+                                   maxsize=CLIENT_CACHE_SIZE,
+                                   ttl=CLIENT_CACHE_TTL)
         
         # Initialize logging first
         logging.basicConfig(level=logging.INFO)
@@ -68,7 +89,7 @@ class MultiMasterGFSClient:
         """Get or create a master stub"""
         if address not in self.master_stubs:
             try:
-                channel = grpc.insecure_channel(address)
+                channel = grpc.insecure_channel(address, options=GRPC_CHANNEL_OPTIONS)
                 stub = gfs_pb2_grpc.MasterServiceStub(channel)
                 self.master_stubs[address] = stub
                 self.logger.debug(f"Connected to master at {address}")
@@ -264,7 +285,7 @@ class MultiMasterGFSClient:
         
         if server_addr not in self.chunk_server_stubs:
             try:
-                channel = grpc.insecure_channel(server_addr)
+                channel = grpc.insecure_channel(server_addr, options=GRPC_CHANNEL_OPTIONS)
                 stub = gfs_pb2_grpc.ChunkServerServiceStub(channel)
                 self.chunk_server_stubs[server_addr] = stub
                 self.logger.debug(f"Connected to chunk server at {server_addr}")
@@ -289,7 +310,11 @@ class MultiMasterGFSClient:
                 return False
         
         try:
-            return self._execute_with_leader_failover(_create_file_op, filename)
+            ok = self._execute_with_leader_failover(_create_file_op, filename)
+            if ok:
+                # A negative result may be cached from before it existed.
+                self.cache.invalidate_file(filename)
+            return ok
         except Exception as e:
             self.logger.error(f"Error creating file {filename}: {e}")
             return False
@@ -309,7 +334,10 @@ class MultiMasterGFSClient:
                 return False
         
         try:
-            return self._execute_with_leader_failover(_delete_file_op, filename)
+            ok = self._execute_with_leader_failover(_delete_file_op, filename)
+            if ok:
+                self.cache.invalidate_file(filename)
+            return ok
         except Exception as e:
             self.logger.error(f"Error deleting file {filename}: {e}")
             return False
@@ -332,8 +360,15 @@ class MultiMasterGFSClient:
                 self.logger.error(f"Failed to get file info for {filename}: {response.message}")
                 return None
         
+        cached = self.cache.get_file_info(filename)
+        if cached is not None:
+            return cached
+
         try:
-            return self._execute_with_leader_failover(_get_file_info_op, filename)
+            info = self._execute_with_leader_failover(_get_file_info_op, filename)
+            if info is not None:
+                self.cache.put_file_info(filename, info)
+            return info
         except Exception as e:
             self.logger.error(f"Error getting file info for {filename}: {e}")
             return None
@@ -353,13 +388,36 @@ class MultiMasterGFSClient:
                         'address': location.address,
                         'port': location.port
                     })
+                if response.ec.is_ec:
+                    # Stash the shard map beside the replica list. Kept on
+                    # the client rather than resolved by the master because
+                    # the paper's rule holds for EC too: the client talks to
+                    # chunk servers directly and the master only says where.
+                    self._ec_info[chunk_handle] = {
+                        'k': response.ec.data_shards,
+                        'm': response.ec.parity_shards,
+                        'original_length': response.ec.original_length,
+                        'shards': [
+                            {'server_id': sl.server_id, 'address': sl.address,
+                             'port': sl.port, 'shard_index': sl.shard_index}
+                            for sl in response.ec.shards
+                        ],
+                    }
                 return locations
             else:
                 self.logger.error(f"Failed to get chunk locations for {chunk_handle}: {response.message}")
                 return []
         
+        cached = self.cache.get_locations(chunk_handle)
+        if cached is not None:
+            return cached
+
         try:
-            return self._execute_with_leader_failover(_get_chunk_locations_op, chunk_handle)
+            locations = self._execute_with_leader_failover(
+                _get_chunk_locations_op, chunk_handle)
+            if locations:
+                self.cache.put_locations(chunk_handle, locations)
+            return locations
         except Exception as e:
             self.logger.error(f"Error getting chunk locations for {chunk_handle}: {e}")
             return []
@@ -388,7 +446,16 @@ class MultiMasterGFSClient:
                 return None
         
         try:
-            return self._execute_with_leader_failover(_allocate_chunk_op, filename, chunk_index)
+            result = self._execute_with_leader_failover(
+                _allocate_chunk_op, filename, chunk_index)
+            if result:
+                handle, locations = result
+                # The response already carries authoritative locations, so
+                # seed them rather than making the next read ask again.
+                self.cache.put_locations(handle, locations)
+                # The file's chunk list just changed.
+                self.cache.invalidate_file(filename)
+            return result
         except Exception as e:
             self.logger.error(f"Error allocating chunk for {filename}: {e}")
             return None
@@ -469,7 +536,8 @@ class MultiMasterGFSClient:
         
         return sorted_locations
 
-    def read_chunk(self, chunk_handle: str, offset: int, length: int) -> Optional[bytes]:
+    def read_chunk(self, chunk_handle: str, offset: int, length: int,
+                   retried_fresh: bool = False) -> Optional[bytes]:
         """
         Read data from a chunk - implements GFS read data flow with network proximity optimization:
         1. Client contacts master to get chunk locations
@@ -478,6 +546,16 @@ class MultiMasterGFSClient:
         4. No master involvement in data transfer
         """
         locations = self.get_chunk_locations(chunk_handle)
+        if not locations:
+            # Could be a genuinely missing chunk, a stale empty cache entry,
+            # or a chunk that has been erasure-coded and no longer has whole
+            # replicas at all. Refresh once to find out which.
+            self._forget_chunk(chunk_handle)
+            locations = self.get_chunk_locations(chunk_handle)
+
+        if not locations and chunk_handle in self._ec_info:
+            return self._read_chunk_ec(chunk_handle, offset, length)
+
         if not locations:
             raise Exception(f"No locations found for chunk {chunk_handle}")
 
@@ -518,10 +596,108 @@ class MultiMasterGFSClient:
         if read_errors:
             error_details.append(f"Read errors: {'; '.join(read_errors)}")
         
+        # Every replica we knew about failed. If those came from the cache,
+        # the most likely explanation is that the chunk moved -- a server
+        # died and re-replication put it somewhere else. Drop the entry and
+        # ask the master once before giving up.
+        #
+        # This is the half of caching that makes it safe rather than merely
+        # fast: without it the client keeps hammering dead replicas until the
+        # TTL happens to expire. ADR-006.
+        if not retried_fresh and self._forget_chunk(chunk_handle):
+            self.logger.info(
+                f"all cached replicas for {chunk_handle} failed; refreshing from master")
+            # The chunk may have been erasure-coded since this map was
+            # cached, in which case the refreshed answer has no replicas at
+            # all and the read continues down the shard path.
+            return self.read_chunk(chunk_handle, offset, length, retried_fresh=True)
+
         full_error_msg = f"Unable to reach any chunk server for chunk {chunk_handle}. Tried {len(sorted_locations)} replicas. " + "; ".join(error_details)
-        
+
         self.logger.error(full_error_msg)
         raise Exception(full_error_msg)
+
+
+    # ------------------------------------------------------------------
+    # Erasure-coded reads (ADR-005)
+    # ------------------------------------------------------------------
+    def _forget_chunk(self, chunk_handle: str) -> bool:
+        """Drop everything cached about one chunk's placement.
+
+        Returns whether anything was actually dropped, so a caller can tell
+        'our cache was wrong, retry' from 'we had nothing cached, so this
+        answer is already fresh' -- without which the retry recurses.
+        """
+        dropped = self.cache.invalidate_chunk(chunk_handle)
+        if self._ec_info.pop(chunk_handle, None) is not None:
+            dropped = True
+        return dropped
+
+    def _read_chunk_ec(self, chunk_handle: str, offset: int, length: int,
+                       retried_fresh: bool = False):
+        """Reconstruct a chunk from its shards.
+
+        Fetches shards until k are in hand, then decodes. Data shards are
+        tried first: the code is systematic, so if all k data shards are
+        present the "decode" is a concatenation and costs nothing. Only when
+        a data shard is actually missing does this pay a matrix inversion --
+        which is why a healthy EC read is nearly as cheap as a replica read
+        and a degraded one is not.
+        """
+        info = self._ec_info.get(chunk_handle)
+        if not info:
+            raise Exception(f"No erasure-coding info for chunk {chunk_handle}")
+
+        k, m = info['k'], info['m']
+        shards = sorted(info['shards'], key=lambda s: s['shard_index'])
+        data_first = ([s for s in shards if s['shard_index'] < k]
+                      + [s for s in shards if s['shard_index'] >= k])
+
+        collected, failures = {}, []
+        for shard in data_first:
+            if len(collected) >= k:
+                break
+            try:
+                with grpc.insecure_channel(f"{shard['address']}:{shard['port']}",
+                                           options=GRPC_CHANNEL_OPTIONS) as ch:
+                    stub = gfs_pb2_grpc.ChunkServerServiceStub(ch)
+                    resp = stub.ReadShard(gfs_pb2.ReadShardRequest(
+                        chunk_handle=gfs_pb2.ChunkHandle(handle=chunk_handle),
+                        shard_index=shard['shard_index']), timeout=60.0)
+                    if resp.success:
+                        collected[shard['shard_index']] = resp.data
+                    else:
+                        failures.append(f"{shard['server_id']}: {resp.message}")
+            except grpc.RpcError as e:
+                failures.append(f"{shard['server_id']}: {e.code()}")
+
+        if len(collected) < k:
+            # A cached shard map goes stale for two ordinary reasons: a
+            # server died, or repair rebuilt the shard somewhere else. Drop
+            # it and ask the master once before declaring the chunk
+            # unreadable -- the same invalidate-on-contradiction rule the
+            # replica path uses (ADR-006).
+            self.cache.invalidate_chunk(chunk_handle)
+            had_map = self._ec_info.pop(chunk_handle, None) is not None
+            if had_map and not retried_fresh:
+                self.logger.info(
+                    f"stale shard map for {chunk_handle} "
+                    f"({len(collected)}/{k} reachable); refreshing from master")
+                self.get_chunk_locations(chunk_handle)
+                if chunk_handle in self._ec_info:
+                    return self._read_chunk_ec(chunk_handle, offset, length,
+                                               retried_fresh=True)
+            raise Exception(
+                f"chunk {chunk_handle}: only {len(collected)} of {k} shards "
+                f"reachable; {'; '.join(failures[:4])}")
+
+        degraded = any(i not in collected for i in range(k))
+        data = decode_chunk(collected, k, m, info['original_length'])
+        if degraded:
+            self.logger.info(
+                f"degraded read of {chunk_handle}: reconstructed from "
+                f"{len(collected)} shards")
+        return data[offset:offset + length] if (offset or length) else data
 
     def write_chunk_with_lease(self, chunk_handle: str, offset: int, data: bytes, locations: List[dict]) -> bool:
         """
@@ -689,7 +865,7 @@ class MultiMasterGFSClient:
 
         return result_data[:length]
 
-    def write_file_with_shifting(self, filename: str, data: bytes, offset: int = 0) -> bool:
+    def _write_file_with_shifting_impl(self, filename: str, data: bytes, offset: int = 0) -> bool:
         """
         Write data to a file with proper handling of data shifting across chunks.
         This handles the complex case where writing to the middle of a file can affect multiple chunks.
@@ -817,7 +993,7 @@ class MultiMasterGFSClient:
         return True
 
     
-    def write_file(self, filename: str, data: bytes, offset: int = 0) -> bool:
+    def _write_file_impl(self, filename: str, data: bytes, offset: int = 0) -> bool:
         """Write data to a file with proper GFS lease protocol"""
         filename = self.normalize_path(filename)
 
@@ -889,7 +1065,7 @@ class MultiMasterGFSClient:
             return False
 
     
-    def write_file_simple(self, filename: str, data: bytes, offset: int = 0) -> bool:
+    def _write_file_simple_impl(self, filename: str, data: bytes, offset: int = 0) -> bool:
         """
         Simple write implementation for writes to end of file (original algorithm)
         """
@@ -1020,7 +1196,7 @@ class MultiMasterGFSClient:
     #     self.logger.error(f"Failed to append to file {filename} after {max_retries} retries")
     #     return False
 
-    def append_file(self, filename: str, data: bytes) -> bool:
+    def _append_file_impl(self, filename: str, data: bytes) -> bool:
         """Append data to a file using GFS atomic record append
         
         GFS Record Append (Section 3.3):
@@ -1114,6 +1290,37 @@ class MultiMasterGFSClient:
         
         return False
 
+
+    # ------------------------------------------------------------------
+    # Cache-invalidating wrappers around the mutating paths (ADR-006)
+    # ------------------------------------------------------------------
+    # Invalidating inside the implementations is not enough: they call
+    # get_file_info() again on the way out, which re-caches the size the
+    # master had *before* the write committed. The next read then truncates
+    # to the stale length -- silently, and only for the client that did the
+    # write. Dropping the entry on exit is the only ordering that holds
+    # regardless of what the implementation does internally.
+
+    def _after_mutation(self, filename: str, result):
+        self.cache.invalidate_file(self.normalize_path(filename))
+        return result
+
+    def write_file(self, filename: str, data: bytes, offset: int = 0) -> bool:
+        return self._after_mutation(
+            filename, self._write_file_impl(filename, data, offset))
+
+    def write_file_simple(self, filename: str, data: bytes, offset: int = 0) -> bool:
+        return self._after_mutation(
+            filename, self._write_file_simple_impl(filename, data, offset))
+
+    def write_file_with_shifting(self, filename: str, data: bytes, offset: int = 0) -> bool:
+        return self._after_mutation(
+            filename, self._write_file_with_shifting_impl(filename, data, offset))
+
+    def append_file(self, filename: str, data: bytes) -> bool:
+        return self._after_mutation(
+            filename, self._append_file_impl(filename, data))
+
     def get_cluster_status(self) -> Dict:
         """Get status of the GFS cluster"""
         def _get_cluster_status_op(stub):
@@ -1191,7 +1398,13 @@ class MultiMasterGFSClient:
                 return False
         
         try:
-            return self._execute_with_leader_failover(_update_file_size_op, filename, new_size, offset, length)
+            ok = self._execute_with_leader_failover(
+                _update_file_size_op, filename, new_size, offset, length)
+            if ok:
+                # Size changed; a cached GetFileInfo would now under-report
+                # and reads would silently truncate.
+                self.cache.invalidate_file(filename)
+            return ok
         except Exception as e:
             self.logger.error(f"Error updating file size for {filename}: {e}")
             return False
@@ -1212,7 +1425,10 @@ class MultiMasterGFSClient:
                 return False
         
         try:
-            return self._execute_with_leader_failover(_create_directory_op, directory_path)
+            ok = self._execute_with_leader_failover(_create_directory_op, directory_path)
+            if ok:
+                self.cache.invalidate_tree(directory_path)
+            return ok
         except Exception as e:
             self.logger.error(f"Error creating directory {directory_path}: {e}")
             return False
@@ -1232,7 +1448,14 @@ class MultiMasterGFSClient:
                 return False
         
         try:
-            return self._execute_with_leader_failover(_delete_directory_op, directory_path, recursive)
+            ok = self._execute_with_leader_failover(
+                _delete_directory_op, directory_path, recursive)
+            if ok:
+                # A recursive delete removes files the client never named,
+                # so the whole subtree has to go -- there is no way to
+                # enumerate what the master considered to be under it.
+                self.cache.invalidate_tree(directory_path)
+            return ok
         except Exception as e:
             self.logger.error(f"Error deleting directory {directory_path}: {e}")
             return False

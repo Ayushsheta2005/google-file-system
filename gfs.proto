@@ -67,6 +67,20 @@ message MasterHeartbeatResponse {
   bool success = 1;
   int64 term = 2;
   bool acknowledge_primary = 3;
+  // So a freshly elected leader can tell whether any peer holds newer
+  // metadata than it does, before it starts serving. See ADR-007.
+  int64 metadata_version = 4;
+}
+
+message FetchMetadataRequest {
+  string requester_id = 1;
+}
+
+message FetchMetadataResponse {
+  bool success = 1;
+  string metadata_json = 2;
+  int64 version = 3;
+  int64 term = 4;
 }
 
 // Master service messages
@@ -117,8 +131,9 @@ message GetChunkLocationsRequest {
 
 message GetChunkLocationsResponse {
   bool success = 1;
-  repeated ChunkLocation locations = 2;
+  repeated ChunkLocation locations = 2;   // empty when the chunk is EC
   string message = 3;
+  ECInfo ec = 4;
 }
 
 message AllocateChunkRequest {
@@ -149,18 +164,31 @@ message HeartbeatRequest{
   int32 port = 4;
   string server_address = 5;
   int32 total_chunks = 6;
+  // Shards held, reported the same way whole chunks are: the chunk server's
+  // disk is the authority and the master rebuilds placement from this.
+  repeated ShardLocation shards = 7;
 }
 
 message HeartbeatResponse {
   bool success = 1;
-  repeated ChunkLocation chunks_to_delete=2;
+  // Chunks this server should reclaim: deleted files, and replicas whose
+  // version is behind the master's. Was typed ChunkLocation, which made no
+  // sense -- the master is naming chunks, not servers. See ADR-004.
+  repeated ChunkHandle chunks_to_delete = 2;
   repeated ReplicationTask replication_tasks = 3;
+  repeated ECEncodeTask ec_encode_tasks = 4;
+  repeated ECRepairTask ec_repair_tasks = 5;
+  repeated DeleteShardRequest shards_to_delete = 6;
 }
 
 message ReplicationTask {
   ChunkHandle chunk_handle = 1;
   repeated ChunkLocation source_locations = 2;
   ChunkLocation target_location = 3;
+  // The version the clone must match. A source that has fallen behind would
+  // otherwise let a stale replica propagate and count toward the replication
+  // factor. See ADR-003.
+  int32 chunk_version = 4;
 }
 
 // Master discovery messages
@@ -173,6 +201,135 @@ message GetPrimaryMasterResponse {
   MasterInfo primary_master = 2;
   repeated MasterInfo all_masters = 3;
   string message = 4;
+}
+
+// ===================================================================
+// Erasure coding (ADR-005)
+// ===================================================================
+// A chunk is stored EITHER as `replication_factor` whole replicas (hot) OR
+// as k+m Reed-Solomon shards on distinct servers (warm). Never both: the
+// conversion drops the replicas only after every shard is confirmed placed.
+
+message ShardLocation {
+  string server_id = 1;
+  string address = 2;
+  int32 port = 3;
+  int32 shard_index = 4;   // 0..k-1 are data shards, k..k+m-1 are parity
+
+  // Everything needed to interpret this shard travels with it. A server
+  // holding shard 3 may never have seen any other part of the chunk, and
+  // the master learns placement only from these reports -- so the shard
+  // report has to be self-describing. `original_length` especially: without
+  // it the master cannot tell a client how much of the decoded output is
+  // real data rather than zero padding, and every read returns empty.
+  string chunk_handle = 5;
+  int64 original_length = 6;
+  int32 data_shards = 7;
+  int32 parity_shards = 8;
+}
+
+message ECInfo {
+  bool is_ec = 1;
+  int32 data_shards = 2;
+  int32 parity_shards = 3;
+  int64 original_length = 4;   // pre-padding; without it decode returns a
+                               // file that is silently longer than it was
+  repeated ShardLocation shards = 5;
+}
+
+// Chunk server stores one shard of a chunk.
+message StoreShardRequest {
+  ChunkHandle chunk_handle = 1;
+  int32 shard_index = 2;
+  bytes data = 3;
+  int32 chunk_version = 4;
+  int64 original_length = 5;
+  int32 data_shards = 6;
+  int32 parity_shards = 7;
+}
+
+message StoreShardResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ReadShardRequest {
+  ChunkHandle chunk_handle = 1;
+  int32 shard_index = 2;
+}
+
+message ReadShardResponse {
+  bool success = 1;
+  bytes data = 2;
+  int32 shard_index = 3;
+  string message = 4;
+}
+
+message DeleteShardRequest {
+  ChunkHandle chunk_handle = 1;
+  int32 shard_index = 2;
+}
+
+message DeleteShardResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Master tells a chunk server holding a full replica to encode it and push
+// the shards out. Issued on the heartbeat reply, like replication tasks.
+message ECEncodeTask {
+  ChunkHandle chunk_handle = 1;
+  int32 data_shards = 2;
+  int32 parity_shards = 3;
+  int32 chunk_version = 4;
+  repeated ChunkLocation shard_targets = 5;  // exactly k+m, in shard order
+}
+
+// Master tells a chunk server to rebuild one missing shard from survivors.
+message ECRepairTask {
+  ChunkHandle chunk_handle = 1;
+  int32 shard_index = 2;           // the shard to rebuild
+  int32 data_shards = 3;
+  int32 parity_shards = 4;
+  int64 original_length = 5;
+  repeated ShardLocation sources = 6;
+}
+
+// Cluster introspection. Added so tests and the benchmark harness can read
+// replication health directly instead of inferring it by counting files on
+// disk, and so recovery time can be measured as "under_replicated -> 0".
+message GetClusterStatusRequest {
+}
+
+message ChunkServerStatus {
+  string server_id = 1;
+  string address = 2;
+  int32 port = 3;
+  int64 available_space = 4;
+  int32 total_chunks = 5;
+  double heartbeat_age_seconds = 6;
+  bool alive = 7;
+}
+
+message GetClusterStatusResponse {
+  bool success = 1;
+  bool is_leader = 2;
+  string leader_id = 3;
+  int64 term = 4;
+  int64 metadata_version = 5;
+  int32 total_files = 6;
+  int32 total_chunks = 7;
+  int32 under_replicated_chunks = 8;
+  int32 unavailable_chunks = 9;
+  int32 clones_in_flight = 10;
+  int32 pending_deletions = 11;
+  repeated ChunkServerStatus chunk_servers = 12;
+  int32 ec_chunks = 13;
+  int32 replicated_chunks = 14;
+  int32 ec_chunks_degraded = 15;      // missing at least one shard
+  int32 ec_encodes_in_flight = 16;
+  double logical_bytes = 17;
+  double physical_bytes = 18;         // logical * overhead; the EC headline
 }
 
 // Directory operations messages
@@ -345,12 +502,18 @@ service MasterService {
   
   // NEW: Add UpdateFileSize RPC for client to notify master of size changes
   rpc UpdateFileSize(UpdateFileSizeRequest) returns (UpdateFileSizeResponse);
+
+  // Introspection for tests, benchmarks and monitoring
+  rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
 }
 
 service MasterElectionService {
   rpc RequestVote(ElectionRequest) returns (ElectionResponse);
   rpc SendHeartbeat(MasterHeartbeatRequest) returns (MasterHeartbeatResponse);
   rpc SyncMetadata(SyncMetadataRequest) returns (SyncMetadataResponse);
+  // Pull direction: a new leader catching up from a peer that has newer
+  // state than it does.
+  rpc FetchMetadata(FetchMetadataRequest) returns (FetchMetadataResponse);
 }
 
 service ChunkServerService {
@@ -359,6 +522,11 @@ service ChunkServerService {
   rpc AppendChunk(AppendChunkRequest) returns (AppendChunkResponse);
   rpc GetChunkChecksum(GetChunkChecksumRequest) returns (GetChunkChecksumResponse);
   rpc PushData(PushDataRequest) returns (PushDataResponse);
+
+  // Erasure coding (ADR-005)
+  rpc StoreShard(StoreShardRequest) returns (StoreShardResponse);
+  rpc ReadShard(ReadShardRequest) returns (ReadShardResponse);
+  rpc DeleteShard(DeleteShardRequest) returns (DeleteShardResponse);
 }
 
 service GFSMaster {

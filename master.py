@@ -16,16 +16,37 @@ from enum import Enum
 
 import gfs_pb2
 import gfs_pb2_grpc
+from oplog import (
+    OperationLog, CheckpointStore,
+    OP_CREATE_FILE, OP_DELETE_FILE, OP_CREATE_DIR, OP_DELETE_DIR, OP_MOVE,
+    OP_ALLOCATE_CHUNK, OP_UPDATE_CHUNK_SIZE, OP_UPDATE_FILE_SIZE,
+    OP_BUMP_CHUNK_VERSION,
+)
+from gfs_config import (
+    OPLOG_MODE, OPLOG_GROUP_COMMIT_MS, CHECKPOINT_EVERY_OPS, CHECKPOINT_KEEP,
+    MAX_CLONES_IN_FLIGHT_PER_SERVER, MAX_CLONES_IN_FLIGHT_CLUSTER,
+    REPLICATION_SCAN_INTERVAL, STORAGE_MODE, EC_DATA_SHARDS, EC_PARITY_SHARDS,
+    EC_WARM_AFTER_SECONDS, LEADER_LEASE_WINDOW,
+)
+from replication import ReplicationManager
+from ec_manager import ECManager
 
-# Configuration constants
-CHUNK_SIZE = 64 * 1024 * 1024  # 64MB
-REPLICATION_FACTOR = 3
-HEARTBEAT_INTERVAL = 30  # seconds
-LEASE_TIMEOUT = 60  # seconds
-ELECTION_TIMEOUT_MIN = 5000  # milliseconds - increased for network delays
-ELECTION_TIMEOUT_MAX = 8000  # milliseconds - increased for network delays
-MASTER_HEARTBEAT_INTERVAL = 200  # milliseconds - increased for network delays
-INITIAL_ELECTION_TIMEOUT = 10000  # milliseconds - 10 secs for startup discovery
+# Configuration constants live in gfs_config so that every process in the
+# cluster -- and the benchmark harness -- reads the same knobs. See ADR-008.
+from gfs_config import (
+    CHUNK_SIZE,
+    REPLICATION_FACTOR,
+    HEARTBEAT_INTERVAL,
+    HEARTBEAT_MISS_LIMIT,
+    LEASE_TIMEOUT,
+    ELECTION_TIMEOUT_MIN,
+    ELECTION_TIMEOUT_MAX,
+    MASTER_HEARTBEAT_INTERVAL,
+    INITIAL_ELECTION_TIMEOUT,
+    DEFAULT_MAX_WORKERS,
+    GRPC_SERVER_OPTIONS,
+    GRPC_CHANNEL_OPTIONS,
+)
 
 # Path constants
 PATH_SEPARATOR = '/'
@@ -47,6 +68,12 @@ class ChunkMetadata:
     lease_expiry: float = 0
     size: int = 0
     checksum: Optional[str] = None
+    # When this chunk was last written. The hot/warm split in ADR-005 needs
+    # it: a chunk still being appended to must never be pulled into an
+    # encode. Defaults to 0 so a chunk recovered from an old checkpoint
+    # without the field is treated as cold, which is the safe direction --
+    # the eligibility check also requires full replication.
+    last_modified: float = 0.0
 
 @dataclass
 class FileMetadata:
@@ -117,6 +144,13 @@ class MultiMasterGFS:
         self.votes_received = set()
         self.metadata_version = 0
         
+        # When a majority of peers last confirmed this node is still the
+        # leader. A partitioned leader has no way to learn it was deposed --
+        # nothing reaches it to say so -- so lease grants are gated on this.
+        # Found necessary by the simulator (ADR-007).
+        self.last_majority_ack = 0.0
+        self.peer_acks: Dict[str, float] = {}
+
         # Election timing
         self.last_heartbeat_time = time.time()
         self.election_timeout = self._get_initial_election_timeout()  # Start with long timeout
@@ -164,8 +198,29 @@ class MultiMasterGFS:
         self.election_thread = None
         self.heartbeat_thread = None
         
-        # Load existing metadata (now logger is available)
-        self.load_metadata()
+        # Re-replication and chunk GC (ADR-003, ADR-004). The proto has
+        # carried ReplicationTask and chunks_to_delete from the start; this is
+        # what finally issues them.
+        self.replication = ReplicationManager(
+            replication_factor=REPLICATION_FACTOR,
+            max_in_flight_per_server=MAX_CLONES_IN_FLIGHT_PER_SERVER,
+            max_in_flight_cluster=MAX_CLONES_IN_FLIGHT_CLUSTER,
+            logger=self.logger)
+
+        # Erasure coding (ADR-005). Only converts anything when
+        # GFS_STORAGE_MODE=ec; otherwise it tracks nothing and costs nothing,
+        # which is what makes the A/B benchmark a fair comparison.
+        self.ec_enabled = (STORAGE_MODE == 'ec')
+        self.ec = ECManager(data_shards=EC_DATA_SHARDS,
+                            parity_shards=EC_PARITY_SHARDS,
+                            warm_after=EC_WARM_AFTER_SECONDS,
+                            logger=self.logger)
+
+        # Durability: operation log + checkpoints (ADR-001)
+        self._init_durability()
+
+        # Rebuild state from the newest checkpoint plus the log tail
+        self.recover()
         
         # Ensure root directory exists
         self._ensure_root_directory()
@@ -194,7 +249,7 @@ class MultiMasterGFS:
         if peer_id not in self.peer_stubs:
             try:
                 peer = self.peers[peer_id]
-                channel = grpc.insecure_channel(f"{peer.address}:{peer.port}")
+                channel = grpc.insecure_channel(f"{peer.address}:{peer.port}", options=GRPC_CHANNEL_OPTIONS)
                 stub = gfs_pb2_grpc.MasterElectionServiceStub(channel)
                 self.peer_stubs[peer_id] = stub
                 self.logger.info(f"Connected to peer {peer_id}")
@@ -263,7 +318,20 @@ class MultiMasterGFS:
             self.leader_id = None
             
             self.logger.info(f"Starting election for term {self.current_term}")
-            
+
+            # A node's own vote can already be a majority. The majority test
+            # otherwise only runs when a peer's vote *comes back*, so a
+            # single-master deployment -- no peers, nothing to come back --
+            # campaigned forever and never served a request. Same arithmetic
+            # as in _request_vote_from_peer, applied to the self-vote.
+            total_nodes = len(self.peers) + 1
+            if len(self.votes_received) > total_nodes // 2:
+                self.logger.info(
+                    f"Won election for term {self.current_term} on own vote "
+                    f"({len(self.votes_received)}/{total_nodes})")
+                threading.Thread(target=self.become_leader, daemon=True).start()
+                return
+
             # Request votes from all peers
             for peer_id in self.peers:
                 threading.Thread(target=self._request_vote_from_peer, 
@@ -314,11 +382,92 @@ class MultiMasterGFS:
                 
             self.state = MasterState.LEADER
             self.leader_id = self.master_id
-            
+            # Winning an election means majority contact as of now.
+            self.last_majority_ack = time.time()
+            self.peer_acks = {}
+
             self.logger.info(f"Became leader for term {self.current_term}")
-            
+
+        # Outside the state lock: this makes RPCs and must not block the
+        # election machinery.
+        self.catch_up_from_peers()
+
+        with self.state_lock:
             # Send immediate heartbeats to establish leadership
             self.send_heartbeats_to_peers()
+
+    def catch_up_from_peers(self):
+        """Adopt any peer's metadata that is newer than ours, before serving.
+
+        A master that was down or partitioned while writes were acknowledged
+        can win the next election holding stale state, and would then serve
+        a namespace missing those writes. The simulator reproduced this on
+        7.6% of fault schedules before the fix (ADR-007).
+
+        This narrows the window rather than closing it. A write acknowledged
+        by the old leader alone, which no surviving peer ever received, is
+        still lost -- only majority-ack-before-reply fixes that, and that
+        means a genuine replicated log. Stated plainly because the
+        difference matters: this is not consensus.
+        """
+        best_peer, best_version = None, self.metadata_version
+        for peer_id in list(self.peers):
+            try:
+                stub = self.connect_to_peer(peer_id)
+                if not stub:
+                    continue
+                resp = stub.SendHeartbeat(gfs_pb2.MasterHeartbeatRequest(
+                    master_id=self.master_id, term=self.current_term,
+                    is_primary=True, metadata_version=self.metadata_version),
+                    timeout=2.0)
+                if resp.success and resp.metadata_version > best_version:
+                    best_peer, best_version = peer_id, resp.metadata_version
+            except Exception as e:
+                self.logger.debug(f'catch-up probe of {peer_id} failed: {e}')
+
+        if not best_peer:
+            self.logger.info(
+                f'catch-up: no peer newer than version {self.metadata_version}')
+            return
+
+        try:
+            stub = self.connect_to_peer(best_peer)
+            resp = stub.FetchMetadata(
+                gfs_pb2.FetchMetadataRequest(requester_id=self.master_id),
+                timeout=10.0)
+            if not resp.success or resp.version <= self.metadata_version:
+                return
+            self.apply_metadata_blob(resp.metadata_json, resp.version)
+            self.logger.info(
+                f'caught up from {best_peer}: version '
+                f'{self.metadata_version} -> {resp.version}')
+        except Exception as e:
+            # Serving slightly stale state is bad; refusing to serve at all
+            # is worse. Log loudly and carry on -- the periodic sync will
+            # converge things shortly.
+            self.logger.error(
+                f'catch-up from {best_peer} failed ({e}); serving possibly '
+                f'stale metadata at version {self.metadata_version}')
+
+    def apply_metadata_blob(self, metadata_json: str, version: int):
+        """Adopt a peer's serialized metadata wholesale."""
+        data = json.loads(metadata_json)
+        with self.metadata_lock:
+            self.files = {k: FileMetadata(**v)
+                          for k, v in data.get('files', {}).items()}
+            self.directories = {k: DirectoryMetadata(**v)
+                                for k, v in data.get('directories', {}).items()}
+            self.chunks = {}
+            for handle, cd in data.get('chunks', {}).items():
+                cd = dict(cd)
+                # Locations are rebuilt from heartbeats, never adopted from a
+                # peer's view of them (ADR-001).
+                cd['locations'] = set()
+                cd.pop('primary', None)
+                cd.pop('lease_expiry', None)
+                self.chunks[handle] = ChunkMetadata(**cd)
+            self.metadata_version = version
+            self.persist_synced_state()
 
     def send_heartbeats_to_peers(self):
         """Send heartbeats to all peers as leader"""
@@ -344,13 +493,23 @@ class MultiMasterGFS:
             )
             
             response = stub.SendHeartbeat(request, timeout=1.0)
-            
+
             with self.state_lock:
                 if response.term > self.current_term:
                     self.current_term = response.term
                     self.voted_for = None
                     self.state = MasterState.FOLLOWER
                     self.leader_id = None
+                    return
+
+                # A peer answered, so this node is still in contact with it.
+                if response.success and self.state == MasterState.LEADER:
+                    now = time.time()
+                    self.peer_acks[peer_id] = now
+                    fresh = sum(1 for t in self.peer_acks.values()
+                                if now - t <= LEADER_LEASE_WINDOW)
+                    if fresh + 1 > (len(self.peers) + 1) // 2:
+                        self.last_majority_ack = now
                     
         except Exception as e:
             self.logger.debug(f"Heartbeat to {peer_id} failed: {e}")
@@ -459,6 +618,321 @@ class MultiMasterGFS:
                     }
             return None
 
+
+    # ======================================================================
+    # Durability: operation log + checkpoints (ADR-001, ADR-002)
+    # ======================================================================
+    # The original master dumped all metadata to JSON every 30 seconds from a
+    # background thread, so a crash lost up to 30s of acknowledged operations.
+    # Here every mutation is appended to an fsync'd log before the client is
+    # told it succeeded, and checkpoints keep replay bounded.
+
+    def _init_durability(self):
+        """Open the log and checkpoint store. Called from __init__."""
+        self.data_dir = os.path.dirname(os.path.abspath(self.metadata_file)) or '.'
+        os.makedirs(self.data_dir, exist_ok=True)
+
+        self.durable = (OPLOG_MODE == 'oplog')
+        self.checkpoint_number = 0
+        self.oplog = None
+        self.checkpoints = None
+
+        if self.durable:
+            self.oplog = OperationLog(
+                os.path.join(self.data_dir, 'oplog.bin'),
+                group_commit_ms=OPLOG_GROUP_COMMIT_MS,
+                logger=self.logger)
+            self.checkpoints = CheckpointStore(
+                self.data_dir, keep=CHECKPOINT_KEEP, logger=self.logger)
+        self._checkpoint_lock = threading.Lock()
+
+
+    # ======================================================================
+    # Erasure coding cycle (ADR-005)
+    # ======================================================================
+
+    def _run_ec_cycle(self, live: Set[str]):
+        """Convert cold chunks, repair degraded ones, retire superseded
+        replicas. Called from the background loop, leader only."""
+        # Replicas of chunks whose full shard set is now confirmed. Doing
+        # this first means the space is reclaimed before more encodes start.
+        for handle in self.ec.take_replicas_to_drop():
+            chunk = self.chunks.get(handle)
+            if chunk is None:
+                continue
+            st = self.ec.state(handle)
+            if st is None or len(st.shards) < st.n:
+                # Should not happen, but dropping replicas on a partial
+                # shard set is the one unrecoverable mistake here.
+                self.logger.error(
+                    f'refusing to drop replicas of {handle}: shard set incomplete')
+                continue
+            freed = chunk.locations
+            chunk.locations = set()
+
+            # Clearing master-side locations is not enough: the bytes are
+            # still on those disks, and the ordinary GC diff will never flag
+            # them because the master *does* still know this chunk -- it is
+            # erasure-coded now, not deleted. Without this the conversion
+            # adds 1.5x of shards on top of 3x of replicas and makes storage
+            # worse, which is the exact opposite of the point.
+            for server_id in freed:
+                self.replication._pending_deletes.setdefault(
+                    server_id, set()).add(handle)
+            self.logger.info(
+                f'🗑️  retiring {len(freed)} whole replica(s) of {handle} '
+                f'now that {st.n} shards are placed')
+
+        n_enc = self.ec.plan_encodes(self.chunks, self.chunk_servers, live)
+        n_rep = self.ec.plan_repairs(self.chunk_servers, live)
+        if n_enc or n_rep:
+            self.logger.info(
+                f'EC cycle: {n_enc} encode(s), {n_rep} shard repair(s) scheduled')
+
+    def live_chunk_servers(self) -> Set[str]:
+        """Servers that have heartbeated recently enough to be trusted.
+
+        The old code spelled this `HEARTBEAT_INTERVAL * 2` inline in four
+        places. With a 30s interval that meant a dead server stayed 'live'
+        for a full minute. Named and configurable now -- see ADR-008.
+        """
+        cutoff = time.time() - (HEARTBEAT_INTERVAL * HEARTBEAT_MISS_LIMIT)
+        return {sid for sid, s in self.chunk_servers.items()
+                if s.last_heartbeat >= cutoff}
+
+    def commit(self, op: str, **fields):
+        """Make a mutation durable, then propagate it.
+
+        Call this *after* mutating in-memory state and *before* replying to
+        the client. The ordering is the whole guarantee: when the client sees
+        success, the record is already fsync'd.
+        """
+        self.metadata_version += 1
+        if self.durable:
+            self.oplog.append(op, version=self.metadata_version, **fields)
+            self._maybe_checkpoint()
+        else:
+            # Legacy snapshot mode, kept so the benchmark suite can measure
+            # what the operation log actually bought us.
+            self.save_metadata()
+        self.sync_metadata_to_peers()
+
+    def apply_record(self, rec: dict):
+        """Re-apply one logged record to in-memory state during recovery.
+
+        Records store the *effect* of an operation (which paths changed), not
+        the request that caused it. That means replay never re-runs path
+        validation or placement logic, so recovery cannot diverge from the
+        original execution just because a config value changed in between.
+        """
+        op = rec.get('op')
+
+        if op == OP_CREATE_FILE:
+            t = rec.get('created_time', rec.get('ts', 0))
+            self.files[rec['filename']] = FileMetadata(
+                filename=rec['filename'], chunks=[], size=0,
+                created_time=t, modified_time=t)
+
+        elif op == OP_DELETE_FILE:
+            for name in rec.get('filenames', []):
+                fm = self.files.pop(name, None)
+                if fm:
+                    for h in fm.chunks:
+                        self.chunks.pop(h, None)
+
+        elif op == OP_CREATE_DIR:
+            t = rec.get('created_time', rec.get('ts', 0))
+            self.directories[rec['dirname']] = DirectoryMetadata(
+                dirname=rec['dirname'], created_time=t, modified_time=t,
+                parent_dir=rec.get('parent_dir'))
+
+        elif op == OP_DELETE_DIR:
+            for name in rec.get('filenames', []):
+                fm = self.files.pop(name, None)
+                if fm:
+                    for h in fm.chunks:
+                        self.chunks.pop(h, None)
+            for name in rec.get('dirnames', []):
+                self.directories.pop(name, None)
+
+        elif op == OP_MOVE:
+            t = rec.get('ts', 0)
+            for src, dst in rec.get('files', []):
+                fm = self.files.pop(src, None)
+                if fm:
+                    fm.filename = dst
+                    fm.modified_time = t
+                    self.files[dst] = fm
+            for src, dst in rec.get('dirs', []):
+                dm = self.directories.pop(src, None)
+                if dm:
+                    dm.dirname = dst
+                    dm.modified_time = t
+                    self.directories[dst] = dm
+
+        elif op == OP_ALLOCATE_CHUNK:
+            handle = rec['chunk_handle']
+            self.chunks[handle] = ChunkMetadata(
+                handle=handle,
+                version=rec.get('chunk_version', 1),
+                locations=set(),   # rebuilt from heartbeats, never logged
+                size=0)
+            fm = self.files.get(rec['filename'])
+            if fm is not None:
+                idx = rec.get('chunk_index', len(fm.chunks))
+                while len(fm.chunks) <= idx:
+                    fm.chunks.append(None)
+                fm.chunks[idx] = handle
+
+        elif op == OP_UPDATE_CHUNK_SIZE:
+            c = self.chunks.get(rec['chunk_handle'])
+            if c is not None:
+                c.size = rec['size']
+                c.last_modified = rec.get('ts', c.last_modified)
+            owner = rec.get('filename')
+            if owner and rec.get('file_size') is not None:
+                fm = self.files.get(owner)
+                if fm is not None:
+                    fm.size = rec['file_size']
+
+        elif op == OP_UPDATE_FILE_SIZE:
+            fm = self.files.get(rec['filename'])
+            if fm is not None:
+                fm.size = rec['size']
+                fm.modified_time = rec.get('modified_time', rec.get('ts', fm.modified_time))
+
+        elif op == OP_BUMP_CHUNK_VERSION:
+            c = self.chunks.get(rec['chunk_handle'])
+            if c is not None:
+                c.version = rec['chunk_version']
+
+        else:
+            self.logger.warning(f'recovery: ignoring unknown op {op!r}')
+
+        v = rec.get('version')
+        if isinstance(v, int) and v > self.metadata_version:
+            self.metadata_version = v
+
+    def _snapshot_state(self) -> dict:
+        """Serialize everything a checkpoint must carry.
+
+        Replica locations are excluded on purpose: the chunk servers are the
+        authority on what they actually hold, and the master rebuilds the
+        location map from heartbeats within one heartbeat interval of
+        starting. A logged location is a lie as soon as a disk dies.
+        """
+        return {
+            'files': {k: asdict(v) for k, v in self.files.items()},
+            'directories': {k: asdict(v) for k, v in self.directories.items()},
+            'chunks': {
+                h: {'handle': c.handle, 'version': c.version,
+                    'size': c.size, 'checksum': c.checksum}
+                for h, c in self.chunks.items()
+            },
+            'version': self.metadata_version,
+            'term': self.current_term,
+        }
+
+    def _restore_state(self, snap: dict):
+        self.files.clear()
+        self.directories.clear()
+        self.chunks.clear()
+        for name, d in snap.get('files', {}).items():
+            self.files[name] = FileMetadata(**d)
+        for name, d in snap.get('directories', {}).items():
+            self.directories[name] = DirectoryMetadata(**d)
+        for handle, d in snap.get('chunks', {}).items():
+            self.chunks[handle] = ChunkMetadata(
+                handle=d['handle'], version=d.get('version', 1),
+                locations=set(), size=d.get('size', 0),
+                checksum=d.get('checksum'))
+        self.metadata_version = snap.get('version', 0)
+        self.current_term = max(self.current_term, snap.get('term', 0))
+
+    def write_checkpoint(self) -> bool:
+        """Checkpoint, then truncate the log it covers."""
+        if not self.durable:
+            return False
+        with self._checkpoint_lock:
+            with self.metadata_lock:
+                snap = self._snapshot_state()
+                self.checkpoint_number += 1
+                number = self.checkpoint_number
+            self.checkpoints.write(number, snap)
+            # Safe only because the checkpoint is already fsync'd and renamed.
+            self.oplog.reset()
+            self.logger.info(
+                f'checkpoint {number} written '
+                f'({len(snap["files"])} files, {len(snap["chunks"])} chunks); oplog truncated')
+            return True
+
+    def persist_synced_state(self):
+        """Make state received from the leader durable on a follower.
+
+        A follower does not write operation-log records -- it never saw the
+        individual mutations, only the leader's snapshot -- so it checkpoints
+        instead. This matters because a follower that wins the next election
+        serves this state as authoritative, and losing it on restart would
+        silently roll the namespace back.
+        """
+        if not self.durable:
+            self.save_metadata()
+            return
+        try:
+            self.write_checkpoint()
+        except Exception as e:
+            self.logger.error(f'follower checkpoint failed: {e}')
+
+    def _maybe_checkpoint(self):
+        if not self.durable:
+            return
+        if self.oplog.records_since_checkpoint < CHECKPOINT_EVERY_OPS:
+            return
+        # Off the request path; a checkpoint must never block a client write.
+        t = threading.Thread(target=self._checkpoint_quietly, daemon=True)
+        t.start()
+
+    def _checkpoint_quietly(self):
+        try:
+            self.write_checkpoint()
+        except Exception as e:
+            self.logger.error(f'checkpoint failed: {e}')
+
+    def recover(self):
+        """Rebuild state at startup: newest good checkpoint, then log tail."""
+        if not self.durable:
+            self.load_metadata()
+            return
+
+        discarded = self.oplog.truncate_tail()
+
+        latest = self.checkpoints.latest()
+        if latest:
+            number, snap = latest
+            self.checkpoint_number = number
+            self._restore_state(snap)
+            self.logger.info(
+                f'recovered checkpoint {number}: {len(self.files)} files, '
+                f'{len(self.chunks)} chunks, version {self.metadata_version}')
+        else:
+            # First boot after migrating off the old JSON snapshot: adopt it
+            # once, then never read it again.
+            self.load_metadata()
+            if self.files or self.directories:
+                self.logger.info(
+                    f'migrated legacy metadata.json: {len(self.files)} files')
+
+        replayed = 0
+        for rec in self.oplog.replay(tolerate_tail=True):
+            self.apply_record(rec)
+            replayed += 1
+
+        self.logger.info(
+            f'recovery complete: replayed {replayed} log records'
+            + (f', discarded {discarded}B torn tail' if discarded else '')
+            + f'; now {len(self.files)} files / {len(self.chunks)} chunks '
+              f'at version {self.metadata_version}')
+
     def load_metadata(self):
         """Load metadata from persistent storage"""
         try:
@@ -533,10 +1007,36 @@ class MultiMasterGFS:
         
         return available_servers[:REPLICATION_FACTOR]
 
+    def has_leader_lease(self) -> bool:
+        """Whether this node may still act as leader for writes.
+
+        A leader that has lost contact with a majority cannot know whether
+        it has been deposed, and a replacement may already be granting
+        leases on the other side of the partition. Refusing here, strictly
+        before any replacement could have been elected, is what keeps the
+        'one primary per chunk' invariant true.
+
+        The window must be comfortably shorter than the minimum election
+        timeout. With 800ms as the floor there, 400ms leaves a margin the
+        other side cannot beat. See ADR-007.
+        """
+        if self.state != MasterState.LEADER:
+            return False
+        if not self.peers:
+            return True      # single-master: it is trivially the majority
+        return (time.time() - self.last_majority_ack) <= LEADER_LEASE_WINDOW
+
     def grant_lease(self, chunk_handle: str) -> Optional[str]:
         """Grant lease to a chunk server for writing"""
         with self.lease_lock:
             if chunk_handle not in self.chunks:
+                return None
+
+            if not self.has_leader_lease():
+                stale = time.time() - self.last_majority_ack
+                self.logger.warning(
+                    f'refusing lease on {chunk_handle}: no majority contact '
+                    f'for {stale:.2f}s -- this node may have been deposed')
                 return None
                 
             chunk = self.chunks[chunk_handle]
@@ -563,6 +1063,9 @@ class MultiMasterGFS:
             
             chunk.primary = primary
             chunk.lease_expiry = time.time() + LEASE_TIMEOUT
+            # A granted lease means a write is coming, so treat the chunk as
+            # hot now rather than after the write lands.
+            chunk.last_modified = time.time()
             
             self.logger.info(f"Granted lease for chunk {chunk_handle} to {primary} , version = {chunk.version}")
             return primary
@@ -579,26 +1082,35 @@ class MultiMasterGFS:
                             chunk.primary = None
                             chunk.lease_expiry = 0
                     
-                    # Check for under-replicated chunks
-                    for handle, chunk in self.chunks.items():
-                        alive_locations = [
-                            loc for loc in chunk.locations
-                            if loc in self.chunk_servers and
-                            current_time - self.chunk_servers[loc].last_heartbeat < HEARTBEAT_INTERVAL * 2
-                        ]
-                        
-                        if len(alive_locations) < REPLICATION_FACTOR:
-                            self.logger.warning(f"Chunk {handle} is under-replicated: {len(alive_locations)}/{REPLICATION_FACTOR}")
+                    # Queue clone work for anything under-replicated. The
+                    # tasks go out on the next heartbeat reply to whichever
+                    # server was chosen as target. ADR-003.
+                    if self.is_leader():
+                        live = self.live_chunk_servers()
+                        scheduled = self.replication.plan(
+                            self.chunks, self.chunk_servers, live)
+                        if scheduled:
+                            self.logger.info(
+                                f'scheduled {scheduled} re-replication task(s)')
+
+                        if self.ec_enabled:
+                            self._run_ec_cycle(live)
                 
                 # Save metadata periodically (only if leader)
                 if self.is_leader():
-                    self.save_metadata()
+                    # Durability is handled per-mutation by the operation log now.
+                    # This loop only rolls checkpoints and re-syncs peers. ADR-001.
+                    if self.durable:
+                        if self.oplog.records_since_checkpoint >= CHECKPOINT_EVERY_OPS:
+                            self._checkpoint_quietly()
+                    else:
+                        self.save_metadata()
                     self.sync_metadata_to_peers()
                 
             except Exception as e:
                 self.logger.error(f"Background task error: {e}")
             
-            time.sleep(30)  # Run every 30 seconds
+            time.sleep(REPLICATION_SCAN_INTERVAL)
 
     def start_background_tasks(self):
         """Start background tasks"""
@@ -778,9 +1290,7 @@ class MultiMasterGFS:
                 deleted_files.append(filepath)
             
             if deleted_files:
-                self.metadata_version += 1
-                self.save_metadata()
-                self.sync_metadata_to_peers()
+                self.commit(OP_DELETE_FILE, filenames=deleted_files)
         
         return deleted_files
 
@@ -819,9 +1329,9 @@ class MultiMasterGFS:
             )
             
             self.directories[normalized_path] = dir_metadata
-            self.metadata_version += 1
-            self.save_metadata()
-            self.sync_metadata_to_peers()
+            self.commit(OP_CREATE_DIR, dirname=normalized_path,
+                        created_time=current_time,
+                        parent_dir=dir_metadata.parent_dir)
             
             self.logger.info(f"Created directory: {normalized_path}")
             return True
@@ -927,9 +1437,10 @@ class MultiMasterGFS:
             del self.directories[normalized_dir]
             deleted_items.append(f"dir:{normalized_dir}")
             
-            self.metadata_version += 1
-            self.save_metadata()
-            self.sync_metadata_to_peers()
+            self.commit(
+                OP_DELETE_DIR,
+                dirnames=[i[4:] for i in deleted_items if i.startswith('dir:')],
+                filenames=[i for i in deleted_items if not i.startswith('dir:')])
             
             self.logger.info(f"Deleted directory: {normalized_dir} ({'recursive' if recursive else 'empty'})")
             return True, f"Directory {normalized_dir} deleted successfully", deleted_items
@@ -989,9 +1500,7 @@ class MultiMasterGFS:
                 self.files[normalized_dst] = file_metadata
                 del self.files[normalized_src]
                 
-                self.metadata_version += 1
-                self.save_metadata()
-                self.sync_metadata_to_peers()
+                self.commit(OP_MOVE, files=[[normalized_src, normalized_dst]], dirs=[])
                 
                 self.logger.info(f"Moved file: {normalized_src} -> {normalized_dst}")
                 return True, f"File moved successfully"
@@ -1013,8 +1522,13 @@ class MultiMasterGFS:
                         new_filepath = dst_dir + filepath[len(src_dir):]
                         items_to_move.append(('file', filepath, new_filepath))
                 
+                # `src_dir` itself matches this prefix test, and the block
+                # below already moves it explicitly. Without the exclusion it
+                # lands in items_to_move too and the second pass raises
+                # KeyError on a directory it just deleted -- so moving any
+                # directory that contained a subdirectory crashed the master.
                 for dirpath in list(self.directories.keys()):
-                    if dirpath.startswith(src_dir):
+                    if dirpath.startswith(src_dir) and dirpath != src_dir:
                         new_dirpath = dst_dir + dirpath[len(src_dir):]
                         items_to_move.append(('dir', dirpath, new_dirpath))
                 
@@ -1041,9 +1555,11 @@ class MultiMasterGFS:
                         self.directories[new_path] = dir_metadata
                         del self.directories[old_path]
                 
-                self.metadata_version += 1
-                self.save_metadata()
-                self.sync_metadata_to_peers()
+                self.commit(
+                    OP_MOVE,
+                    files=[[o, n] for t, o, n in items_to_move if t == 'file'],
+                    dirs=[[src_dir, dst_dir]]
+                         + [[o, n] for t, o, n in items_to_move if t == 'dir'])
                 
                 self.logger.info(f"Moved directory: {normalized_src} -> {normalized_dst}")
                 return True, f"Directory moved successfully"
@@ -1060,8 +1576,8 @@ class MultiMasterGFS:
                     parent_dir=None
                 )
                 self.directories[ROOT_PATH] = root_metadata
-                self.metadata_version += 1
-                self.save_metadata()
+                self.commit(OP_CREATE_DIR, dirname=ROOT_PATH,
+                            created_time=root_metadata.created_time, parent_dir=None)
                 self.logger.info("Created root directory metadata")
 
 class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
@@ -1130,9 +1646,8 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
             )
             
             self.master.files[normalized_path] = file_metadata
-            self.master.metadata_version += 1
-            self.master.save_metadata()
-            self.master.sync_metadata_to_peers()
+            self.master.commit(OP_CREATE_FILE, filename=normalized_path,
+                               created_time=current_time)
             
             self.master.logger.info(f"Created file: {normalized_path}")
             return gfs_pb2.CreateFileResponse(
@@ -1190,9 +1705,7 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
                     del self.master.chunks[chunk_handle]
             
             del self.master.files[normalized_path]
-            self.master.metadata_version += 1
-            self.master.save_metadata()
-            self.master.sync_metadata_to_peers()
+            self.master.commit(OP_DELETE_FILE, filenames=[normalized_path])
             
             self.master.logger.info(f"Deleted file: {normalized_path}")
             return gfs_pb2.DeleteFileResponse(
@@ -1257,7 +1770,7 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
             
             chunk = self.master.chunks[chunk_handle]
             locations = []
-            
+
             for server_id in chunk.locations:
                 if server_id in self.master.chunk_servers:
                     server = self.master.chunk_servers[server_id]
@@ -1266,11 +1779,35 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
                         address=server.address,
                         port=server.port
                     ))
-            
-            return gfs_pb2.GetChunkLocationsResponse(
+
+            resp = gfs_pb2.GetChunkLocationsResponse(
                 success=True,
                 locations=locations
             )
+
+            # If this chunk has been erasure-coded, hand back the shard map
+            # too (ADR-005). Both are returned during the conversion window:
+            # replicas still exist until every shard is confirmed, and a
+            # client that can use either is a client that never sees the
+            # migration. Once the replicas are retired, `locations` is empty
+            # and the client falls through to the shard path.
+            st = self.master.ec.state(chunk_handle)
+            if st is not None and st.shards:
+                resp.ec.is_ec = True
+                resp.ec.data_shards = st.k
+                resp.ec.parity_shards = st.m
+                resp.ec.original_length = st.original_length
+                for index, server_id in sorted(st.shards.items()):
+                    server = self.master.chunk_servers.get(server_id)
+                    if server is None:
+                        continue
+                    sl = resp.ec.shards.add()
+                    sl.server_id = server_id
+                    sl.address = server.address
+                    sl.port = server.port
+                    sl.shard_index = index
+
+            return resp
 
     def AllocateChunk(self, request, context):
         """Allocate a new chunk for a file"""
@@ -1313,7 +1850,8 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
             chunk_metadata = ChunkMetadata(
                 handle=chunk_handle,
                 version=1,
-                locations=set(selected_servers)
+                locations=set(selected_servers),
+                last_modified=time.time()
             )
             
             self.master.chunks[chunk_handle] = chunk_metadata
@@ -1330,9 +1868,11 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
                 if server_id in self.master.chunk_servers:
                     self.master.chunk_servers[server_id].chunks.add(chunk_handle)
             
-            self.master.metadata_version += 1
-            self.master.save_metadata()
-            self.master.sync_metadata_to_peers()
+            self.master.commit(OP_ALLOCATE_CHUNK,
+                               filename=normalized_filename,
+                               chunk_index=chunk_index,
+                               chunk_handle=chunk_handle,
+                               chunk_version=chunk_metadata.version)
             
             # Prepare response
             locations = []
@@ -1457,8 +1997,111 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
                 # Update address and port in case they changed
                 server_info.address = address
                 server_info.port = port
-            
-            return gfs_pb2.HeartbeatResponse(success=True)
+
+            # ---- shard reports (ADR-005) ----
+            # Each report is self-describing, so the master learns a chunk's
+            # coding parameters and original length from the first shard it
+            # hears about -- it never has to have been told separately.
+            reported_shards = set()
+            for sl in request.shards:
+                reported_shards.add((sl.chunk_handle, sl.shard_index))
+                self.master.ec.note_shard_present(
+                    sl.chunk_handle, sl.shard_index, server_id,
+                    sl.data_shards, sl.parity_shards, sl.original_length)
+            # A shard this server stopped reporting is gone from it.
+            for base, st in list(self.master.ec.ec_chunks.items()):
+                for idx, holder in list(st.shards.items()):
+                    if holder == server_id and (base, idx) not in reported_shards:
+                        self.master.ec.note_shard_absent(base, idx, server_id)
+
+            # ---- learn replica locations from what the server reports ----
+            # The master never persists locations (ADR-001); this is where
+            # they come from. It is also how a completed clone is noticed:
+            # the target simply starts reporting the chunk.
+            for handle in chunks:
+                chunk = self.master.chunks.get(handle)
+                if chunk is not None:
+                    if server_id not in chunk.locations:
+                        chunk.locations.add(server_id)
+                        self.master.replication.note_replica_present(handle, server_id)
+
+            # A server that stops reporting a chunk no longer has it.
+            for handle, chunk in self.master.chunks.items():
+                if server_id in chunk.locations and handle not in chunks:
+                    chunk.locations.discard(server_id)
+
+            if not self.master.is_leader():
+                # Followers track locations so they are useful immediately on
+                # promotion, but only the leader hands out work.
+                return gfs_pb2.HeartbeatResponse(success=True)
+
+            # ---- reclaim orphaned and stale replicas (ADR-004) ----
+            self.master.replication.plan_deletions({server_id: chunks},
+                                                   self.master.chunks)
+            to_delete = self.master.replication.deletions_for(server_id)
+
+            # ---- hand out clone work (ADR-003) ----
+            tasks = self.master.replication.tasks_for(
+                server_id, self.master.chunks, self.master.chunk_servers)
+
+            # ---- hand out erasure-coding work (ADR-005) ----
+            ec_encodes, ec_repairs, shard_deletes = [], [], []
+            if self.master.ec_enabled:
+                ec_encodes = self.master.ec.encode_tasks_for(
+                    server_id, self.master.chunks, self.master.chunk_servers)
+                ec_repairs = self.master.ec.repair_tasks_for(
+                    server_id, self.master.chunk_servers)
+                self.master.ec.plan_shard_deletions({server_id: reported_shards})
+                shard_deletes = self.master.ec.shard_deletions_for(server_id)
+
+        response = gfs_pb2.HeartbeatResponse(success=True)
+        for handle in to_delete:
+            response.chunks_to_delete.add(handle=handle)
+        for t in tasks:
+            task = response.replication_tasks.add()
+            task.chunk_handle.handle = t['chunk_handle']
+            task.chunk_version = t['chunk_version']
+            for src in t['sources']:
+                loc = task.source_locations.add()
+                loc.server_id, loc.address, loc.port = (
+                    src['server_id'], src['address'], src['port'])
+            task.target_location.server_id = t['target']['server_id']
+            task.target_location.address = t['target']['address']
+            task.target_location.port = t['target']['port']
+
+        for t in ec_encodes:
+            task = response.ec_encode_tasks.add()
+            task.chunk_handle.handle = t['chunk_handle']
+            task.data_shards, task.parity_shards = t['k'], t['m']
+            task.chunk_version = t['chunk_version']
+            for tgt in t['targets']:
+                loc = task.shard_targets.add()
+                loc.server_id, loc.address, loc.port = (
+                    tgt['server_id'], tgt['address'], tgt['port'])
+
+        for t in ec_repairs:
+            task = response.ec_repair_tasks.add()
+            task.chunk_handle.handle = t['chunk_handle']
+            task.shard_index = t['shard_index']
+            task.data_shards, task.parity_shards = t['k'], t['m']
+            task.original_length = t['original_length']
+            for src in t['sources']:
+                loc = task.sources.add()
+                loc.server_id, loc.address, loc.port, loc.shard_index = (
+                    src['server_id'], src['address'], src['port'],
+                    src['shard_index'])
+
+        for handle, idx in shard_deletes:
+            d = response.shards_to_delete.add()
+            d.chunk_handle.handle = handle
+            d.shard_index = idx
+
+        if to_delete or tasks or ec_encodes or ec_repairs:
+            self.master.logger.info(
+                f'heartbeat -> {server_id}: {len(tasks)} clone, '
+                f'{len(to_delete)} delete, {len(ec_encodes)} ec-encode, '
+                f'{len(ec_repairs)} ec-repair')
+        return response
 
     # def GetPrimaryMaster(self, request, context):
     #     """Return information about the primary master"""
@@ -1752,9 +2395,9 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
             file_metadata.size = new_size
             file_metadata.modified_time = time.time()
             
-            self.master.metadata_version += 1
-            self.master.save_metadata()
-            self.master.sync_metadata_to_peers()
+            self.master.commit(OP_UPDATE_FILE_SIZE,
+                               filename=normalized_path, size=new_size,
+                               modified_time=file_metadata.modified_time)
             
             self.master.logger.info(f"Updated file size: {normalized_path} from {old_size} to {new_size} bytes (write at offset {offset}, length {length})")
             
@@ -1762,6 +2405,60 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
                 success=True,
                 message=f"File size updated to {new_size} bytes"
             )
+
+    def GetClusterStatus(self, request, context):
+        """Replication health, for tests, benchmarks and monitoring.
+
+        Served by followers too (with is_leader=False) so a probe does not
+        need to find the leader first. Only the leader's counts are
+        authoritative for replication state, since only the leader plans.
+        """
+        m = self.master
+        with m.metadata_lock:
+            live = m.live_chunk_servers()
+            now = time.time()
+
+            under = 0
+            unavailable = 0
+            for chunk in m.chunks.values():
+                alive = len([s for s in chunk.locations if s in live])
+                if alive == 0 and chunk.locations:
+                    unavailable += 1
+                elif alive < REPLICATION_FACTOR:
+                    under += 1
+
+            repl = m.replication.snapshot()
+            ecs = m.ec.snapshot(live_servers=live)
+            logical, physical = m.ec.overhead_for(m.chunks)
+            resp = gfs_pb2.GetClusterStatusResponse(
+                success=True,
+                is_leader=m.is_leader(),
+                leader_id=m.leader_id or '',
+                term=m.current_term,
+                metadata_version=m.metadata_version,
+                total_files=len(m.files),
+                total_chunks=len(m.chunks),
+                under_replicated_chunks=under,
+                unavailable_chunks=unavailable,
+                clones_in_flight=len(repl['in_flight']),
+                pending_deletions=sum(repl['pending_deletes'].values()),
+                ec_chunks=ecs['ec_chunks'],
+                replicated_chunks=len(m.chunks) - ecs['ec_chunks'],
+                ec_chunks_degraded=ecs['degraded'],
+                ec_encodes_in_flight=ecs['encodes_in_flight'],
+                logical_bytes=logical,
+                physical_bytes=physical,
+            )
+            for sid, info in m.chunk_servers.items():
+                cs = resp.chunk_servers.add()
+                cs.server_id = sid
+                cs.address = info.address
+                cs.port = info.port
+                cs.available_space = info.available_space
+                cs.total_chunks = len(info.chunks)
+                cs.heartbeat_age_seconds = now - info.last_heartbeat
+                cs.alive = sid in live
+            return resp
 
     def RequestLease(self, request, context):
         """Grant write lease for a chunk"""
@@ -1851,6 +2548,9 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
             chunk = self.master.chunks[chunk_handle]
             old_size = chunk.size
             chunk.size = new_size
+            # The hot/warm clock. Without this every chunk looks cold from
+            # the moment it is allocated and EC would fight live writes.
+            chunk.last_modified = time.time()
             
             # Update file size - find which file this chunk belongs to
             for filename, file_metadata in self.master.files.items():
@@ -1866,11 +2566,19 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
                     
                     file_metadata.size = total_size
                     file_metadata.modified_time = time.time()
+                    owner_filename = filename
+                    owner_size = total_size
                     break
-            
-            self.master.metadata_version += 1
-            self.master.save_metadata()
-            self.master.sync_metadata_to_peers()
+            else:
+                owner_filename = None
+                owner_size = None
+
+            # The owning file's size is derived here, so the record has to
+            # carry it -- otherwise replay rebuilds chunks with the right
+            # sizes but leaves every file reporting 0 bytes.
+            self.master.commit(OP_UPDATE_CHUNK_SIZE,
+                               chunk_handle=chunk_handle, size=new_size,
+                               filename=owner_filename, file_size=owner_size)
             
             self.master.logger.info(f"Updated chunk {chunk_handle} size from {old_size} to {new_size}")
             return gfs_pb2.UpdateChunkSizeResponse(
@@ -1879,6 +2587,19 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
             )
 
 class MasterElectionServiceServicer(gfs_pb2_grpc.MasterElectionServiceServicer):
+    def FetchMetadata(self, request, context):
+        """Hand this node's metadata to a newly elected leader catching up."""
+        m = self.master
+        try:
+            return gfs_pb2.FetchMetadataResponse(
+                success=True,
+                metadata_json=m._serialize_metadata(),
+                version=m.metadata_version,
+                term=m.current_term)
+        except Exception as e:
+            m.logger.error(f'FetchMetadata failed: {e}')
+            return gfs_pb2.FetchMetadataResponse(success=False)
+
     def __init__(self, master: MultiMasterGFS):
         self.master = master
 
@@ -1943,7 +2664,10 @@ class MasterElectionServiceServicer(gfs_pb2_grpc.MasterElectionServiceServicer):
             return gfs_pb2.MasterHeartbeatResponse(
                 success=acknowledge,
                 term=self.master.current_term,
-                acknowledge_primary=acknowledge
+                acknowledge_primary=acknowledge,
+                # Lets a freshly elected leader see that this peer holds
+                # newer state and pull it before serving (ADR-007).
+                metadata_version=self.master.metadata_version
             )
 
     def SyncMetadata(self, request, context):
@@ -1981,7 +2705,10 @@ class MasterElectionServiceServicer(gfs_pb2_grpc.MasterElectionServiceServicer):
                             self.master.chunks[handle] = ChunkMetadata(**chunk_data)
                         
                         self.master.metadata_version = version
-                        self.master.save_metadata()
+                        self.master.metadata_version = version
+                        # A follower must make synced state durable too: if it wins the
+                        # next election it serves this state as authoritative. ADR-001.
+                        self.master.persist_synced_state()
                     
                     self.master.logger.info(f"Synced metadata from leader, version {version}")
                     
@@ -2009,12 +2736,20 @@ class MasterElectionServiceServicer(gfs_pb2_grpc.MasterElectionServiceServicer):
                 message="Invalid sync request"
             )
 
-def serve(master_id: str = None, port: int = 9000, peers: List[str] = None):
+def serve(master_id: str = None, port: int = 9000, peers: List[str] = None,
+          data_dir: str = None, max_workers: int = DEFAULT_MAX_WORKERS):
     """Start the GFS Master server with multi-master support"""
-    master = MultiMasterGFS(master_id=master_id, port=port, peers=peers)
+    metadata_file = None
+    if data_dir:
+        os.makedirs(data_dir, exist_ok=True)
+        metadata_file = os.path.join(data_dir, 'metadata.json')
+
+    master = MultiMasterGFS(master_id=master_id, port=port, peers=peers,
+                            metadata_file=metadata_file)
     master.start_background_tasks()
-    
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers),
+                         options=GRPC_SERVER_OPTIONS)
     gfs_pb2_grpc.add_MasterServiceServicer_to_server(
         MasterServiceServicer(master), server
     )
@@ -2043,6 +2778,15 @@ if __name__ == '__main__':
     parser.add_argument('--master-id', type=str, help='Unique master identifier')
     parser.add_argument('--port', type=int, default=9000, help='Port to listen on')
     parser.add_argument('--peers', type=str, nargs='*', help='List of peer master addresses (host:port)')
+    parser.add_argument('--data-dir', type=str, default=None,
+                        help='Directory for this master\'s metadata, oplog and checkpoints')
+    parser.add_argument('--max-workers', type=int, default=DEFAULT_MAX_WORKERS,
+                        help='gRPC server thread pool size')
+    parser.add_argument('--log-level', type=str, default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = parser.parse_args()
-    
-    serve(args.master_id, args.port, args.peers or [])
+
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+    serve(args.master_id, args.port, args.peers or [],
+          data_dir=args.data_dir, max_workers=args.max_workers)
