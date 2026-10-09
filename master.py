@@ -1797,9 +1797,16 @@ class MasterServiceServicer(gfs_pb2_grpc.MasterServiceServicer):
                 resp.ec.data_shards = st.k
                 resp.ec.parity_shards = st.m
                 resp.ec.original_length = st.original_length
+                # Only shards on servers that are actually alive. A dead
+                # server never heartbeats, so it is never removed from
+                # st.shards -- handing its address to a client makes the
+                # client spend its retry budget on connections that cannot
+                # succeed, and with exactly k shards live that is the
+                # difference between a degraded read working and failing.
+                live_now = self.master.live_chunk_servers()
                 for index, server_id in sorted(st.shards.items()):
                     server = self.master.chunk_servers.get(server_id)
-                    if server is None:
+                    if server is None or server_id not in live_now:
                         continue
                     sl = resp.ec.shards.add()
                     sl.server_id = server_id

@@ -166,19 +166,32 @@ def test_survives_losing_m_shards(cluster):
     assert len(holders) >= N_SHARDS, f'only {len(holders)} servers hold shards'
 
     parity = int(EC_ENV['GFS_EC_PARITY_SHARDS'])
+    n_before = cluster.status()['live_chunkservers']
     for victim in holders[:parity]:
         victim.kill()
     print(f'killed {parity} of {len(holders)} shard holders')
 
+    # Wait for the master to notice before reading. Killing exactly m
+    # holders leaves exactly k shards -- zero margin -- so until the master
+    # stops handing out addresses of dead hosts, a single transient failure
+    # drops the client below k and the read legitimately cannot succeed.
+    # That detection window is not what this test is about; surviving m
+    # losses once the cluster knows about them is.
+    cluster.await_condition(
+        lambda s: s['live_chunkservers'] <= n_before - parity, timeout=60,
+        describe=lambda s: f"live={s.get('live_chunkservers')} want<={n_before - parity}")
+
     deadline = time.time() + 60
+    last = None
     while time.time() < deadline:
         try:
             if cluster.client().read_file('/ec/degraded.bin') == payload:
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            last = str(e)[:200]
         time.sleep(1.0)
-    pytest.fail('degraded read failed after losing exactly m shards')
+    pytest.fail(f'degraded read failed after losing exactly m shards; '
+                f'last error: {last}; status={cluster.status()}')
 
 
 def test_storage_overhead_actually_drops(cluster):
