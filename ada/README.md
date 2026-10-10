@@ -3,23 +3,38 @@
 Everything here runs on the cluster side. You run two commands; the scripts
 do the rest.
 
+## The short version
+
+Three commands total.
+
 ```bash
-# 1. from your laptop, copy the project up
-rsync -av --exclude '.venv' --exclude '.git' --exclude 'bench/results' \
-      google_file_system_with_multiple_masters/ \
-      <user>@ada.iiit.ac.in:~/gfs/
-
-# 2. ssh in and set up once
-ssh <user>@ada.iiit.ac.in
-cd ~/gfs && bash ada/setup.sh
-
-# 3. submit
-sbatch ada/bench_single_node.slurm      # full benchmark suite, 1 node
-sbatch ada/bench_multi_node.slurm       # cluster spread across 4 nodes
-sbatch ada/test_suite.slurm             # all 150+ tests
+# 1. from your laptop
+rsync -av --exclude '.venv' --exclude '.venv-ada' --exclude '.git' \
+      --exclude 'bench/results' \
+      google_file_system_with_multiple_masters/ <user>@ada.iiit.ac.in:~/gfs/
 ```
 
-Results land in `bench/results/` and `ada/logs/`.
+```bash
+# 2. on Ada -- sets up, detects partition/account, submits everything
+cd ~/gfs && bash ada/run_all.sh
+```
+
+```bash
+# 3. once the jobs finish (squeue -u $USER to check)
+bash ada/collect.sh
+```
+
+`run_all.sh` detects the partition from `sinfo` and the account from
+`sacctmgr`, skips any job asking for more nodes than the partition has, and
+will not resubmit something already queued. Override detection if needed:
+
+```bash
+GFS_PARTITION=long GFS_ACCOUNT=myaccount bash ada/run_all.sh
+```
+
+`collect.sh` gathers every log and result JSON into `ada/RESULTS.txt`.
+
+Everything below is the manual path, and what each job actually measures.
 
 ## Why run on Ada at all
 
