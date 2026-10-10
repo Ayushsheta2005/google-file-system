@@ -62,4 +62,4 @@ OUT=ada/RESULTS.txt
 echo "wrote $OUT ($(wc -l < "$OUT") lines)"
 echo
 echo "Send it back with:   cat $OUT"
-echo "or from your laptop: scp $USER@ada.iiit.ac.in:~/gfs/$OUT ."
+echo "or from your laptop: scp $USER@ada-gw1:~/gfs/$OUT ."

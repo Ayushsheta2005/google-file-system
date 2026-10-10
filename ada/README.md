@@ -11,8 +11,13 @@ Three commands total.
 # 1. from your laptop
 rsync -av --exclude '.venv' --exclude '.venv-ada' --exclude '.git' \
       --exclude 'bench/results' \
-      google_file_system_with_multiple_masters/ <user>@ada.iiit.ac.in:~/gfs/
+      google_file_system_with_multiple_masters/ <user>@ada-gw1:~/gfs/
 ```
+
+> **Host:** `ada.iiit.ac.in` no longer accepts SSH. Use the gateways
+> `ada-gw1` or `ada-gw2`. If the short name does not resolve, try
+> `ada-gw1.iiit.ac.in`; if that also fails you are probably off the
+> institute network and need the VPN.
 
 ```bash
 # 2. on Ada -- sets up, detects partition/account, submits everything
