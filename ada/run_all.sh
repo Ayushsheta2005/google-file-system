@@ -32,14 +32,17 @@ say "2/4  Scheduler settings"
 # Detect them rather than making the user read sinfo output.
 PARTITION="${GFS_PARTITION:-}"
 if [ -z "$PARTITION" ]; then
-    # Prefer a partition that is idle and accepting jobs, longest timelimit
-    # first -- the benchmark jobs ask for 2-3 hours.
-    PARTITION="$(sinfo -h -o '%P %a %T %l' 2>/dev/null \
-        | awk '$2=="up" && ($3=="idle" || $3=="mixed") {gsub(/\*/,"",$1); print $4, $1}' \
-        | sort -r | head -1 | awk '{print $2}')"
+    # The scheduler's own default partition, marked with '*' in sinfo. An
+    # earlier version ranked partitions by idle nodes and time limit and
+    # picked a small special-purpose one the account could not submit to.
+    # The default is the right answer on every cluster that has one.
+    PARTITION="$(sinfo -h -o '%P' 2>/dev/null | grep '\*' | head -1 | tr -d '*')"
 fi
 if [ -z "$PARTITION" ]; then
-    PARTITION="$(sinfo -h -o '%P' 2>/dev/null | head -1 | tr -d '*')"
+    # No default marked: take whichever up partition has the most nodes.
+    PARTITION="$(sinfo -h -o '%P %a %D' 2>/dev/null \
+        | awk '$2=="up" {gsub(/\*/,"",$1); n[$1]+=$3} END {for (p in n) print n[p], p}' \
+        | sort -rn | head -1 | awk '{print $2}')"
 fi
 if [ -z "$PARTITION" ]; then
     warn "could not detect a partition. Run 'sinfo', then re-run as:"
@@ -77,9 +80,20 @@ submit() {
     out="$(sbatch "${args[@]}" "$script" 2>&1)"
     if [ $? -eq 0 ]; then
         echo "   $label -> ${out}"
-    else
-        warn "$label failed to submit: $out"
+        return 0
     fi
+
+    # sacctmgr can report an account that is not valid for every partition,
+    # and many clusters do not need --account at all. Retry without it
+    # rather than failing on a flag we guessed.
+    if [ -n "$ACCOUNT" ] && echo "$out" | grep -qi 'invalid account'; then
+        out="$(sbatch --partition="$PARTITION" "$script" 2>&1)"
+        if [ $? -eq 0 ]; then
+            echo "   $label -> ${out}  (submitted without --account)"
+            return 0
+        fi
+    fi
+    warn "$label failed to submit: $out"
 }
 
 # ------------------------------------------------------------ 3. correctness

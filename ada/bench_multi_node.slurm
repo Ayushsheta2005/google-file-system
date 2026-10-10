@@ -4,7 +4,7 @@
 #SBATCH --error=ada/logs/bench4n-%j.err
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=20
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=48G
 #SBATCH --time=03:00:00
 ##SBATCH --partition=long
