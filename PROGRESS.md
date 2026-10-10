@@ -47,18 +47,41 @@ cleanly after an interruption. Design rationale lives in `docs/adr/`.
 
 ## Phase 3 — Benchmarks (last, by design)
 
-- [ ] **3.1** Harness + 1 GiB sequential R/W, p50/p95/p99
-- [ ] **3.2** Concurrency sweep N = 1…32 processes
-- [ ] **3.3** 16-writer record-append contention + correctness
-- [ ] **3.4** Failover time, chunkserver-loss recovery, EC degraded-read latency
-- [ ] **3.5** A/B every flag (cache, EC vs 3×, unary vs streamed, group commit)
+- [x] **3.1** Harness + 1 GiB sequential R/W — `bench/bench_throughput.py`
+- [x] **3.2** Concurrency sweep N = 1…32 processes — `bench/bench_concurrent.py`
+- [x] **3.4** Failover, chunkserver-loss recovery, EC conversion — measured in the e2e tests
+- [x] **3.5** A/B: cache on/off, oplog vs snapshot, group commit on/off
+- [ ] **3.3** 16-writer record-append contention — *not done*; the lease path
+      is exercised by the simulator but never benchmarked under contention
+- [ ] **3.6** Results table in the README — results are in `bench/results/*.json`
+      and summarised here, but the README still describes the old system
 - [ ] **3.6** Results → JSON + markdown → README
 
 ## Throughout
 
-- [ ] ADRs in `docs/adr/` — one per decision, written as the code lands
-- [ ] `docs/INTERVIEW.md` — drill sheet
-- [ ] Optional if time: FUSE mount, Prometheus/Grafana, rack-aware placement
+- [x] ADRs in `docs/adr/` — 11 records, one per decision
+- [x] `docs/INTERVIEW.md` — drill sheet
+- [x] `ada/` — setup, 4 SLURM jobs, multi-node runner (**not yet run**)
+- [ ] Optional, not done: FUSE mount, Prometheus/Grafana, rack-aware placement
+
+## Known gaps
+
+Worth being able to name these; an interviewer who reads the code will find
+them anyway.
+
+1. **The metadata path is not consensus.** No replicated log, no majority ack
+   before reply. The simulator still loses acknowledged writes on ~1.2% of
+   fault schedules after both fixes. Porting the Raft implementation from the
+   sibling `raftkv` project is the real fix.
+2. **Group commit is implemented but disabled**, because `commit()` runs
+   under `metadata_lock` so no batch ever forms. Narrowing that lock is the
+   clearest next optimisation for the master.
+3. **Record-append is untested under contention.** 16 concurrent appenders to
+   one file was planned (3.3) and never written.
+4. **The README still describes the pre-rebuild system**, including the
+   "Raft-like consensus" claim that ADR-007 contradicts.
+5. **Every number is single-machine over loopback.** The `ada/` scripts exist
+   to get honest multi-node figures and have not been run.
 
 ---
 
